@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.8 loaded\n")
+print("[GamepadTweaks] v4.9 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -318,7 +318,7 @@ end
 
 -- equipment rows of the Items table: requirements per item id (built once)
 local reqCache = nil
-local kindCache = {}     -- defId -> { sub, skill }  for books (30-38), quest items (60), recipes (99)
+local kindCache = {}     -- defId -> { sub, skill }  for books (30-38), materials (40-49), treasures (50-56), quest items (60), recipes (99)
 local baseCache = {}
 local function buildReqCache()
   reqCache = {}
@@ -332,7 +332,7 @@ local function buildReqCache()
       local b = {}
       row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 4 then b[a.ID] = (b[a.ID] or 0) + a.Num end end)
       baseCache[row.ID] = b
-    elseif (t >= 30 and t <= 38) or (t >= 40 and t <= 49) or t == 60 or t == 99 then
+    elseif (t >= 30 and t <= 38) or (t >= 40 and t <= 56) or t == 60 or t == 99 then
       local sk = nil
       row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 10 and not sk then sk = a.ID end end)
       kindCache[row.ID] = { sub = t, skill = sk }
@@ -417,17 +417,6 @@ local function gridItems(grid)
   return out
 end
 
-local function activeFilter(vm, view)
-  local vn = view:GetFName():ToString()
-  for _, b in ipairs(FindAllOf("BP_BackpackFilterBtn_C") or {}) do
-    if live(b) and b:GetFullName():find(vn, 1, true) then
-      local ok, act = pcall(function() return b.bIsActive end)
-      -- identify the tab by its button, not FilterIndex (Btn_Zhenpin also reports 0 in v1.24.32)
-      if ok and act then local n = b:GetFName():ToString(); return (n == "Btn_All") and 0 or n end
-    end
-  end
-  return -1      -- unknown: treated as "not 全部", so nothing extra is hidden
-end
 local bp = { open = false, sortDone = false, openAt = 0, npc = nil, filter = nil, lit = {} }
 local function resetEntries()
   for addr, en in pairs(bp.lit) do
@@ -500,6 +489,7 @@ local function decide(npc, defId)
         local wt = weaponType(npc); if wt > 0 and (k.sub - 29) ~= wt then d = "u" end   -- teammate cannot learn other weapon arts
       end
     elseif k.sub == 60 or (k.sub >= 40 and k.sub <= 49) then d = "a"            -- quest items, materials
+    elseif k.sub >= 50 and k.sub <= 56 then d = "a"                             -- 珍宝: paintings, chess, tea sets, books, lyre, treasures, flowers
     elseif k.sub == 99 and HIDE.recipeDone[defId] then d = "a"                  -- learned recipe
     end
   end
@@ -527,10 +517,15 @@ local function current()
     end
     if t - (HIDE.ovAt or -1) > 0.5 then HIDE.ovAt = t; local ov = readFirst("npc_override.txt"); HIDE.ov = ov and tonumber(ov) or nil end
     if HIDE.ov then npc = HIDE.ov end
+    -- active tab = vm:GetFilterIndex() (EBackpackFilterType_Console: 0 全部 1 武器 2 防具 3 丹药 4 秘籍 5 材料 6 珍宝 7 任务).
+    -- The filter buttons' bIsActive never changes in v1.24.32 (Btn_All stays active), so up to v4.8 every tab
+    -- was taken for 全部 and "a" items disappeared from their own tabs too.
     local filter = -1
-    for _, b in ipairs(HIDE.btns) do
-      local ok, act = pcall(function() return b.obj.bIsActive end)
-      if ok and act then filter = b.all and 0 or b.name end
+    local vm = HIDE.vm
+    if vm and vm:IsValid() then
+      local ok, fi = pcall(function() return vm:GetFilterIndex() end)
+      if ok and type(fi) == "number" then filter = fi
+      else local js = ""; pcall(function() js = vm.RootData:DataToString():ToString() end); filter = tonumber(js:match('"active_filter_type":(%d+)')) or -1 end
     end
     HIDE.cacheNpc, HIDE.cacheFilter = npc, filter
   end

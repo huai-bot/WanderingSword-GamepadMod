@@ -96,5 +96,4 @@ powershell -File tools\install.ps1
 - 装备属性 = **物品表 `Items` 行的 `Actions`（基础值）+ `ItemInfoSpec.Actions`/`RandActions`（这一件的随机加成）**，只取 `CAttr(4)`；结果与游戏提示框一致（例：亮银甲 44.2+3 → 显示 47）。只比加成会严重误判（v4.4 及以前的 bug）。不考虑特效 buff；属性 ID 与中文名的对应尚未整理（已知 11=防御力、2=气血上限）。
 - `GetDef()` 返回的是 Lua table，其中 `Actions` 也是 table，用 `:ForEach` 会静默失败；读基础属性请直接遍历数据表。
 - 不要按 `ItemInfoSpec` 地址缓存任何东西：`HandleBackpackBatchChange` 会重建对象，地址会被别的物品复用。
-- 切换背包分类标签时被隐藏的装备会闪现约 0.3 秒。
 - 高亮通过给物品格子自带的 `IMG_Focus` 着色实现，原图偏金色，所以内圈仍带一点金色。
