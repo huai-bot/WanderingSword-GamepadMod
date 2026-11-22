@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.4 loaded\n")
+print("[GamepadTweaks] v4.5 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -290,7 +290,7 @@ end
 --   entry BPEntry_Item_WDT_C.BindedDataObject -> ItemInfoSpec ; ItemDisplay.CMP.IMG_Focus = frame we recolour
 local BTN_SORT_EVT = "BndEvt__BPMV_JHBackpack_Basic_BTN_BackpackSort_K2Node_ComponentBoundEvent_2_BtnClick__DelegateSignature"
 local POPUP_KEYS = { [1] = "VE0", [2] = "VE0_1", [3] = "VE0_2", [4] = "VE0_3" }   -- st_id 1 珍贵 2 时间 3 价钱 4 类型
--- highlight colour: [backpack] highlight_rgb = sRGB hex (default B4AAFF, light blue-violet); UMG wants linear colour
+-- highlight colour: [backpack] highlight_rgb = sRGB hex (default 5C6CFF, blue-violet); UMG wants linear colour
 local function iniString(key, def)
   local s = readFirst("wsmod.ini"); if not s then return def end
   s = s:gsub("%z", "")
@@ -299,11 +299,11 @@ end
 local function toLinear(v) v = v / 255; if v <= 0.04045 then return v / 12.92 end return ((v + 0.055) / 1.055) ^ 2.4 end
 local hlHex, hlColor = nil, nil
 local function highlightColor()
-  local h = iniString("highlight_rgb", "B4AAFF")
+  local h = iniString("highlight_rgb", "5C6CFF")
   if h ~= hlHex then
     hlHex = h
     local r, g, b = tonumber(h:sub(1, 2), 16), tonumber(h:sub(3, 4), 16), tonumber(h:sub(5, 6), 16)
-    if not (r and g and b) then r, g, b = 0xB4, 0xAA, 0xFF end
+    if not (r and g and b) then r, g, b = 0x5C, 0x6C, 0xFF end
     hlColor = { R = toLinear(r), G = toLinear(g), B = toLinear(b), A = 1.0 }
   end
   return hlColor
@@ -318,6 +318,7 @@ end
 
 -- equipment rows of the Items table: requirements per item id (built once)
 local reqCache = nil
+local baseCache = {}
 local function buildReqCache()
   reqCache = {}
   local dt = StaticFindObject("/Game/JH/Tables/Items.Items"); if not dt or not dt:IsValid() then return end
@@ -327,6 +328,9 @@ local function buildReqCache()
       local list = {}
       row.Requirements:ForEach(function(i, e) local r = e:get(); list[#list + 1] = { t = r.Type, id = r.ID } end)
       reqCache[row.ID] = { sub = t, req = list }
+      local b = {}
+      row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 4 then b[a.ID] = (b[a.ID] or 0) + a.Num end end)
+      baseCache[row.ID] = b
     end
   end)
 end
@@ -342,8 +346,23 @@ local function canUse(defId, npc)
   return true
 end
 local function slotOf(sub) if sub >= 1 and sub <= 6 then return "W" end if sub >= 10 and sub <= 13 then return sub end return nil end
+-- final stats = base stats from the Items table + the per-item rolled bonus (what the tooltip shows,
+-- e.g. 亮银甲 44.2 + 3 = 47 防御力). v4.3 only summed the rolled bonus and missed the base.
+local function baseStats(defId)
+  local b = baseCache[defId]; if b then return b end
+  b = {}
+  local dt = StaticFindObject("/Game/JH/Tables/Items.Items")
+  if dt and dt:IsValid() then
+    dt:ForEachRow(function(name, row)
+      if row.ID == defId then row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 4 then b[a.ID] = (b[a.ID] or 0) + a.Num end end) end
+    end)
+  end
+  baseCache[defId] = b
+  return b
+end
 local function statsOf(sp)
   local t = {}
+  for k, v in pairs(baseStats(sp.ItemDefId)) do t[k] = v end
   for _, arr in ipairs({ sp.Actions, sp.RandActions }) do
     eachArr(arr, function(i, a) if a.Type == 4 then t[a.ID] = (t[a.ID] or 0) + a.Num end end)
   end
@@ -465,16 +484,14 @@ local function taskBackpack()
         local slot = ent and slotOf(ent.sub)
         -- weapons: only compare against the same weapon type the character is holding
         if slot and canUse(sp.ItemDefId, npc) and not (slot == "W" and worn.wsub and worn.wsub ~= ent.sub and iniNumber("same_weapon_type", 1) == 1) then
-          local ck = string.format("%X", sp:GetAddress())
-          local st = bp.statCache[ck]; if not st then st = statsOf(sp); bp.statCache[ck] = st end
-          good = better(st, worn[slot] or {}, mode)
+          good = better(statsOf(sp), worn[slot] or {}, mode)
         end
       end
       local f = en.ItemDisplay.CMP.IMG_Focus
       if good then
         f:SetColorAndOpacity(highlightColor()); if f:GetVisibility() ~= 3 then f:SetVisibility(3) end
         bp.lit[key] = en; seen[key] = true
-      elseif bp.lit[key] then
+      elseif bp.lit[key] or f.ColorAndOpacity.G < 0.99 then
         f:SetColorAndOpacity(WHITE)
         local focused = false
         pcall(function() focused = en.BTN_JHItem.BtnMain:IsHovered() or en.JHGPCBtn_ActiveBG:IsVisible() end)

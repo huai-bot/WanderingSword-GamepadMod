@@ -92,6 +92,8 @@ powershell -File tools\install.ps1
 - 战斗判定依赖 `BP_FightSpectator_C` 作为 pawn 或战斗技能栏出现，特殊战斗（切磋、擂台、小游戏）未逐一验证。
 - 传送用 `AsyncTaskChangeSceneMap.ChangeSceneMap`，跳过剧情触发可能卡任务；已在战斗、对话、加载时禁止。落地保护（`taskArrival`）兜底：下坠/掉出地图时送回 PlayerStart。
 - 掉出地图后游戏会销毁角色（日志 `is outside the world bounds`），此时 `pc.Pawn` 为空，用 `ChangeSceneMap` 回到该图的 PlayerStart 可以恢复（2026-11-22 实际救援过一次）。
-- 装备比较只看 `Actions`/`RandActions` 里的 `CAttr(4)` 数值，不考虑特效 buff；属性 ID 与中文属性名的对应关系尚未整理。
+- 装备属性 = **物品表 `Items` 行的 `Actions`（基础值）+ `ItemInfoSpec.Actions`/`RandActions`（这一件的随机加成）**，只取 `CAttr(4)`；结果与游戏提示框一致（例：亮银甲 44.2+3 → 显示 47）。只比加成会严重误判（v4.4 及以前的 bug）。不考虑特效 buff；属性 ID 与中文名的对应尚未整理（已知 11=防御力、2=气血上限）。
+- `GetDef()` 返回的是 Lua table，其中 `Actions` 也是 table，用 `:ForEach` 会静默失败；读基础属性请直接遍历数据表。
+- 不要按 `ItemInfoSpec` 地址缓存任何东西：`HandleBackpackBatchChange` 会重建对象，地址会被别的物品复用。
 - 切换背包分类标签时被隐藏的装备会闪现约 0.3 秒。
 - 高亮通过给物品格子自带的 `IMG_Focus` 着色实现，原图偏金色，所以内圈仍带一点金色。
