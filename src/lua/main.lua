@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.6 loaded\n")
+print("[GamepadTweaks] v4.7 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -318,6 +318,7 @@ end
 
 -- equipment rows of the Items table: requirements per item id (built once)
 local reqCache = nil
+local kindCache = {}     -- defId -> { sub, skill }  for books (30-38), quest items (60), recipes (99)
 local baseCache = {}
 local function buildReqCache()
   reqCache = {}
@@ -331,6 +332,10 @@ local function buildReqCache()
       local b = {}
       row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 4 then b[a.ID] = (b[a.ID] or 0) + a.Num end end)
       baseCache[row.ID] = b
+    elseif (t >= 30 and t <= 38) or t == 60 or t == 99 then
+      local sk = nil
+      row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 10 and not sk then sk = a.ID end end)
+      kindCache[row.ID] = { sub = t, skill = sk }
     end
   end)
 end
@@ -412,6 +417,17 @@ local function gridItems(grid)
   return out
 end
 
+local function activeFilter(vm, view)
+  local vn = view:GetFName():ToString()
+  for _, b in ipairs(FindAllOf("BP_BackpackFilterBtn_C") or {}) do
+    if live(b) and b:GetFullName():find(vn, 1, true) then
+      local ok, act = pcall(function() return b.bIsActive end)
+      -- identify the tab by its button, not FilterIndex (Btn_Zhenpin also reports 0 in v1.24.32)
+      if ok and act then local n = b:GetFName():ToString(); return (n == "Btn_All") and 0 or n end
+    end
+  end
+  return -1      -- unknown: treated as "not 全部", so nothing extra is hidden
+end
 local bp = { open = false, sortDone = false, openAt = 0, npc = nil, removed = 0, lit = {}, statCache = {} }
 local function resetEntries(viewName)
   for addr, en in pairs(bp.lit) do
@@ -432,7 +448,7 @@ local function taskBackpack()
   local mark = iniNumber("highlight_better", 1) == 1
   local mode = iniNumber("better_mode", 0)
 
-  if not bp.open then bp.open = true; bp.sortDone = false; bp.openAt = now(); bp.npc = nil; bp.removed = 0; bp.statCache = {} end
+  if not bp.open then bp.open = true; bp.sortDone = false; bp.openAt = now(); bp.npc = nil; bp.filter = nil; bp.removed = 0; bp.statCache = {} end
   -- 1) sort once per opening (after the panel has had a moment to build)
   if not bp.sortDone and now() - bp.openAt > 0.3 then
     bp.sortDone = true
@@ -459,6 +475,14 @@ local function taskBackpack()
     return
   end
   bp.npc = npc
+  local filter = activeFilter(vm, view)
+  if bp.filter ~= nil and filter ~= bp.filter then
+    -- the game rebuilds the list from source on a tab switch, so items hidden in 全部 come back by themselves
+    resetEntries(); bp.removed = 0
+    bp.filter = filter
+    return
+  end
+  bp.filter = filter
   -- 3) hide what this character cannot use
   local grid = view.GRID_ITEM
   local items = gridItems(grid)
@@ -487,6 +511,37 @@ local function taskBackpack()
       end
     end
     if n > 0 then bp.removed = bp.removed + n; print("[GamepadTweaks] backpack: hid " .. n .. " item(s) unusable by npc " .. npc .. "\n") end
+  end
+  -- 3b) "全部" tab only: hide learned manuals (学成), learned recipes (烹饪/锻造/缝制 图纸 学成) and quest items;
+  --     they stay visible in their own category tabs
+  if filter == 0 and iniNumber("tidy_all_tab", 1) == 1 then
+    local info = nil
+    pcall(function() for _, m in ipairs(FindAllOf("NPCManager") or {}) do if live(m) then info = m:GetNPCInfo(npc, false) end end end)
+    local n2 = 0
+    for _, sp in ipairs(gridItems(grid)) do
+      if sp:IsValid() and not sp.bOnlyForLayout then
+        local k = kindCache[sp.ItemDefId]
+        if k then
+          local drop = false
+          if k.sub == 60 then drop = true
+          elseif k.sub >= 30 and k.sub <= 38 and k.skill and info and info:IsValid() then
+            local ok, has = pcall(function() return info:HasSkillById(k.skill) end); drop = ok and has
+          end
+          if drop then grid:RemoveItem(sp); n2 = n2 + 1 end
+        end
+      end
+    end
+    local vn = view:GetFName():ToString()
+    for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
+      if live(en) and en:GetFullName():find(vn, 1, true) then
+        local js = ""; pcall(function() js = en.ItemDisplay:GetData():DataToString():ToString() end)
+        if js:find('"is_recipe":true', 1, true) and js:find('"is_acquired":true', 1, true) then
+          local ok, sp = pcall(function() return en:GetBindedDataObj() end)
+          if ok and sp and sp:IsValid() and not sp.bOnlyForLayout and tonumber(js:match('"setting_id":(%d+)')) == sp.ItemDefId then grid:RemoveItem(sp); n2 = n2 + 1 end
+        end
+      end
+    end
+    if n2 > 0 then bp.removed = bp.removed + n2; print("[GamepadTweaks] backpack: 全部 tab tidy, hid " .. n2 .. " learned/quest item(s)\n") end
   end
   -- 4) highlight better equipment on the visible entries
   if not mark then if next(bp.lit) then resetEntries() end return end

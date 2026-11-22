@@ -56,6 +56,8 @@
 - `EBackpackSortType`：1 Value(珍贵) 2 Time 3 Price 4 ItemType(类型)。游戏启动时重置为 1。
 - 物品格子：`BPEntry_Item_WDT_C`，`BindedDataObject` → `ItemInfoSpec`；`ItemDisplay.CMP` 里有 `IMG_Focus`（选中框，平时 Hidden）、`IMG_Border`、`IMG_QualityBorder`、`IMG_SolidBG`、`IMG_NewMark`。
 - 游戏自己的「当前角色不可用/不可学」判定：格子显示数据（`ItemDisplay:GetData():DataToString()`）里的 `"not_learnable":true`，渲染为 `CMP.IMG_Not_Learnable` 可见（置灰）。武器按角色的武器类型、秘籍按能否学习计算，模组直接沿用。`GetBindedDataObj()` 取格子当前绑定的 `ItemInfoSpec`。
+- 分类标签：`BP_BackpackFilterBtn_C`（`Btn_All/Wu/Fang/Hao/Shu/Cai/Zhenpin/Ren`），`bIsActive` 为当前标签。**`Btn_Zhenpin` 的 `FilterIndex` 也是 0**，要按按钮名判断「全部」。
+- 秘籍「学成」：物品表 `Actions` 中 `ASkill(10)` 的 ID，`TeamInfo:HasSkillById(id)` 为真即已学。图纸学成：格子显示数据 `is_recipe` + `is_acquired`（贴图 `hecheng31_tuzhixuecheng`）。任务道具：`EItemSubType` 60。
 - `JHNeoUIItemUtil:BackpackItemCanDoubleClick_WDT(spec, npc)` 不是可用性判定（置灰的拳套也返回 true），不要用。
 - 注意：`CMP_BackpackSortButton` 是另一个（移动端/旧版）整理按钮，电脑版人物界面里不存在。
 
