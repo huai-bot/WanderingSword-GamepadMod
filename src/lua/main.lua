@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.7 loaded\n")
+print("[GamepadTweaks] v4.8 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -332,7 +332,7 @@ local function buildReqCache()
       local b = {}
       row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 4 then b[a.ID] = (b[a.ID] or 0) + a.Num end end)
       baseCache[row.ID] = b
-    elseif (t >= 30 and t <= 38) or t == 60 or t == 99 then
+    elseif (t >= 30 and t <= 38) or (t >= 40 and t <= 49) or t == 60 or t == 99 then
       local sk = nil
       row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 10 and not sk then sk = a.ID end end)
       kindCache[row.ID] = { sub = t, skill = sk }
@@ -428,28 +428,239 @@ local function activeFilter(vm, view)
   end
   return -1      -- unknown: treated as "not 全部", so nothing extra is hidden
 end
-local bp = { open = false, sortDone = false, openAt = 0, npc = nil, removed = 0, lit = {}, statCache = {} }
-local function resetEntries(viewName)
+local bp = { open = false, sortDone = false, openAt = 0, npc = nil, filter = nil, lit = {} }
+local function resetEntries()
   for addr, en in pairs(bp.lit) do
     pcall(function() if en:IsValid() then local f = en.ItemDisplay.CMP.IMG_Focus; f:SetColorAndOpacity(WHITE); f:SetVisibility(2) end end)
   end
   bp.lit = {}
 end
+
+-- ================================================================ hide pipeline (no flash)
+-- Decisions are per (character, item id) and are computed for every team member once per opening, then
+-- reused for every tab / character switch. Hiding happens in two places:
+--   * hook on the grid's OnEntryInitialized (runs while the game builds a cell, before it is drawn):
+--     a cell that will be removed is made fully transparent right away, so it is never seen
+--   * taskHide (every scheduler tick, ~20 ms): removes those items from the list, and when we trigger the
+--     rebuild ourselves (character switch) removes them before the frame is drawn at all
+-- "u" = unusable by that character: hidden in every tab
+-- "a" = belongs to its own category (learned manual / learned recipe / quest item / material): hidden in 全部 only
+local HOOK_FN = "/Game/JH/JHNeoUI/Modules/Shared/Backpack/Comps/Grid/BP_ItemGridWDT.BP_ItemGridWDT_C:BP_OnEntryInitialized_Event_0"
+local HIDE = { vm = nil, findAt = 0, open = false, view = nil, grid = nil, gridAddr = nil, vn = nil, team = nil, btns = {},
+  hooked = false, hookCount = 0, lastHook = 0, sig = nil, recheckAt = nil, removed = 0, lastNpc = nil, lastFilter = nil,
+  memo = {}, info = {}, wtype = {}, dim = {}, dimWt = {}, recipeDone = {}, srcN = -1, cfgHide = true, cfgTidy = true,
+  cacheAt = -1, cacheNpc = 0, cacheFilter = -1 }
+
+local function teamInfo(npc)
+  local i = HIDE.info[npc]
+  if i and i:IsValid() then return i end
+  i = nil
+  for _, m in ipairs(FindAllOf("NPCManager") or {}) do if live(m) then i = m:GetNPCInfo(npc, false) end end
+  HIDE.info[npc] = i
+  return i
+end
+local function weaponType(npc)
+  local wt = HIDE.wtype[npc]
+  if wt == nil then
+    wt = -1
+    local info = teamInfo(npc)
+    if info and info:IsValid() then pcall(function() wt = info:GetWeaponType() end) end
+    HIDE.wtype[npc] = wt
+  end
+  return wt
+end
+local function teamNpcs()
+  local out = {}
+  local tv = HIDE.team
+  if tv and tv:IsValid() then
+    local js = tv.RootData:DataToString():ToString()
+    for blk in js:gmatch('{[^{}]-"index":%d+[^{}]-}') do
+      if blk:find('"is_valid":true', 1, true) then local id = tonumber(blk:match('"npc_id":(%-?%d+)')); if id and id >= 0 then out[#out + 1] = id end end
+    end
+  end
+  if #out == 0 then out[1] = 0 end
+  return out
+end
+local function decide(npc, defId)
+  local m = HIDE.memo[npc]; if not m then m = {}; HIDE.memo[npc] = m end
+  local d = m[defId]; if d ~= nil then return d end
+  d = false
+  local e, k = reqCache[defId], kindCache[defId]
+  if e then
+    if not canUse(defId, npc) then d = "u"
+    elseif npc ~= 0 and e.sub >= 1 and e.sub <= 6 then
+      local wt = weaponType(npc); if wt > 0 and e.sub ~= wt then d = "u" end      -- teammates: only their weapon type
+    end
+  elseif k then
+    if k.sub >= 30 and k.sub <= 38 then
+      local info = teamInfo(npc); local has = false
+      if k.skill and info and info:IsValid() then pcall(function() has = info:HasSkillById(k.skill) end) end
+      if has then d = "a"                                                        -- 学成: only in 秘籍
+      elseif npc ~= 0 and k.sub <= 35 then
+        local wt = weaponType(npc); if wt > 0 and (k.sub - 29) ~= wt then d = "u" end   -- teammate cannot learn other weapon arts
+      end
+    elseif k.sub == 60 or (k.sub >= 40 and k.sub <= 49) then d = "a"            -- quest items, materials
+    elseif k.sub == 99 and HIDE.recipeDone[defId] then d = "a"                  -- learned recipe
+    end
+  end
+  if d == false then local dm = HIDE.dim[npc]; if dm and dm[defId] then d = "u" end end   -- the game greyed it out before
+  m[defId] = d
+  return d
+end
+local function isHidden(npc, filter, defId)
+  local d = decide(npc, defId)
+  if d == "u" then return HIDE.cfgHide end
+  if d == "a" then return HIDE.cfgTidy and filter == 0 end
+  return false
+end
+-- current character / tab, re-read at most once per 3 ms (one read per batch of cells)
+local function current()
+  local t = os.clock()
+  if t - HIDE.cacheAt > 0.003 then
+    HIDE.cacheAt = t
+    local npc = 0
+    local tv = HIDE.team
+    if tv and tv:IsValid() then
+      local js = tv.RootData:DataToString():ToString()
+      local idx = tonumber(js:match('"focus_npc_index":(%-?%d+)')) or 0
+      for blk in js:gmatch('{[^{}]-"index":' .. idx .. '[^{}]-}') do local id = tonumber(blk:match('"npc_id":(%-?%d+)')); if id and id >= 0 then npc = id end end
+    end
+    if t - (HIDE.ovAt or -1) > 0.5 then HIDE.ovAt = t; local ov = readFirst("npc_override.txt"); HIDE.ov = ov and tonumber(ov) or nil end
+    if HIDE.ov then npc = HIDE.ov end
+    local filter = -1
+    for _, b in ipairs(HIDE.btns) do
+      local ok, act = pcall(function() return b.obj.bIsActive end)
+      if ok and act then filter = b.all and 0 or b.name end
+    end
+    HIDE.cacheNpc, HIDE.cacheFilter = npc, filter
+  end
+  return HIDE.cacheNpc, HIDE.cacheFilter
+end
+local function onEntryInit(self, item, widget)
+  if not HIDE.open or not HIDE.gridAddr then return end
+  local g = self:get(); if not g or not g:IsValid() or g:GetAddress() ~= HIDE.gridAddr then return end
+  local sp, w = item:get(), widget:get()
+  if not sp or not sp:IsValid() or not w or not w:IsValid() then return end
+  HIDE.hookCount = HIDE.hookCount + 1
+  local hid = false
+  if not sp.bOnlyForLayout then local npc, filter = current(); hid = isHidden(npc, filter, sp.ItemDefId) end
+  w:SetRenderOpacity(hid and 0 or 1)
+end
+local function onOpen(vm)
+  local view = vm:GetPairView(); if not view or not view:IsValid() then return false end
+  HIDE.view, HIDE.grid, HIDE.vn = view, view.GRID_ITEM, view:GetFName():ToString()
+  HIDE.gridAddr = HIDE.grid:GetAddress()
+  HIDE.team = nil; for _, v in ipairs(FindAllOf("TeamModuleVM") or {}) do if live(v) then HIDE.team = v end end
+  HIDE.btns = {}
+  for _, b in ipairs(FindAllOf("BP_BackpackFilterBtn_C") or {}) do
+    if live(b) and b:GetFullName():find(HIDE.vn, 1, true) then local n = b:GetFName():ToString(); HIDE.btns[#HIDE.btns + 1] = { obj = b, name = n, all = (n == "Btn_All") } end
+  end
+  if not reqCache then buildReqCache() end
+  HIDE.cfgHide = iniNumber("hide_unusable", 1) == 1
+  HIDE.cfgTidy = iniNumber("tidy_all_tab", 1) == 1
+  HIDE.memo, HIDE.info, HIDE.wtype = {}, {}, {}
+  HIDE.sig, HIDE.removed, HIDE.lastNpc, HIDE.lastFilter, HIDE.cacheAt = nil, 0, nil, nil, -1
+  HIDE.srcN = vm.CurrentDataSrc:GetArrayNum()
+  -- one pass for every team member: all later switches reuse these decisions
+  local t0 = os.clock()
+  local ids = {}
+  vm.CurrentDataSrc:ForEach(function(i, e) ids[e:get().ItemDefId] = true end)
+  local npcs = teamNpcs()
+  for _, npc in ipairs(npcs) do
+    local wt = weaponType(npc)
+    if HIDE.dimWt[npc] ~= nil and HIDE.dimWt[npc] ~= wt then HIDE.dim[npc] = nil end   -- weapon changed: forget greyed list
+    HIDE.dimWt[npc] = wt
+    for id in pairs(ids) do decide(npc, id) end
+  end
+  if not HIDE.hooked and iniNumber("cell_hook", 1) == 1 then
+    HIDE.hooked = true
+    local ok, err = pcall(function() RegisterHook(HOOK_FN, function(self, item, widget) pcall(onEntryInit, self, item, widget) end) end)
+    print("[GamepadTweaks] backpack: cell hook " .. (ok and "registered" or ("failed: " .. tostring(err))) .. "\n")
+  end
+  print(string.format("[GamepadTweaks] backpack: preloaded %d characters x %d items in %.1f ms\n", #npcs, (function() local n = 0 for _ in pairs(ids) do n = n + 1 end return n end)(), (os.clock() - t0) * 1000))
+  return true
+end
+local function taskHide()
+  if inBattle then HIDE.open = false return end
+  local vm = HIDE.vm
+  if not (vm and vm:IsValid()) then
+    if now() < HIDE.findAt then return end
+    HIDE.findAt = now() + 1
+    vm = nil; for _, v in ipairs(FindAllOf("JHMainCharacterBackpackInTeamVM") or {}) do if live(v) then vm = v end end
+    HIDE.vm = vm; if not vm then return end
+  end
+  if not vm:GetModuleVisibility() then HIDE.open = false return end
+  if not HIDE.open then
+    if now() < pauseUntil then return end
+    if not onOpen(vm) then return end
+    HIDE.open = true
+  end
+  local grid = HIDE.grid; if not grid or not grid:IsValid() then HIDE.open = false return end
+  -- inventory changed (item used, equipped, learned): decisions may change
+  local srcN = vm.CurrentDataSrc:GetArrayNum()
+  if srcN ~= HIDE.srcN then HIDE.srcN = srcN; HIDE.memo = {}; HIDE.wtype = {} end
+  local npc, filter = current()
+  local sig = grid:GetNumItems() .. "|" .. npc .. "|" .. tostring(filter) .. "|" .. HIDE.hookCount
+  local recheck = HIDE.recheckAt and now() >= HIDE.recheckAt
+  if sig == HIDE.sig and not recheck then return end
+  if recheck then HIDE.recheckAt = nil end
+  -- character switched while we had items removed: bring them back now and filter in this same tick
+  if HIDE.lastNpc ~= nil and npc ~= HIDE.lastNpc and HIDE.removed > 0 then vm:HandleBackpackBatchChange(); HIDE.removed = 0 end
+  if HIDE.lastFilter ~= nil and filter ~= HIDE.lastFilter then HIDE.removed = 0 end      -- the game rebuilt the list itself
+  HIDE.lastNpc, HIDE.lastFilter = npc, filter
+  local gone, n = {}, 0
+  for _, sp in ipairs(gridItems(grid)) do
+    if sp:IsValid() and not sp.bOnlyForLayout and isHidden(npc, filter, sp.ItemDefId) then
+      grid:RemoveItem(sp); gone[sp:GetAddress()] = true; n = n + 1
+    end
+  end
+  -- learn from what the game itself shows (greyed out / recipe learned) and repair recycled cells
+  local learnt = 0
+  for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
+    if live(en) and en:GetFullName():find(HIDE.vn, 1, true) then
+      local ok, sp = pcall(function() return en:GetBindedDataObj() end)
+      if ok and sp and sp:IsValid() and not sp.bOnlyForLayout then
+        local addr = sp:GetAddress()
+        local js = ""; pcall(function() js = en.ItemDisplay:GetData():DataToString():ToString() end)
+        local sid = tonumber(js:match('"setting_id":(%d+)'))
+        if sid == sp.ItemDefId and not gone[addr] then
+          local newly = false
+          if js:find('"not_learnable":true', 1, true) and decide(npc, sid) == false then
+            HIDE.dim[npc] = HIDE.dim[npc] or {}; HIDE.dim[npc][sid] = true; HIDE.memo[npc][sid] = "u"; newly = true
+          elseif js:find('"is_recipe":true', 1, true) and js:find('"is_acquired":true', 1, true) and not HIDE.recipeDone[sid] then
+            HIDE.recipeDone[sid] = true; for _, mm in pairs(HIDE.memo) do mm[sid] = nil end; newly = true
+          end
+          if newly and isHidden(npc, filter, sid) then grid:RemoveItem(sp); gone[addr] = true; learnt = learnt + 1 end
+        end
+        local want = gone[addr] and 0 or 1
+        local ok2, op = pcall(function() return en:GetRenderOpacity() end)
+        if ok2 and math.abs(op - want) > 0.01 then en:SetRenderOpacity(want) end
+      end
+    end
+  end
+  HIDE.removed = HIDE.removed + n + learnt
+  if n + learnt > 0 then print(string.format("[GamepadTweaks] backpack: npc %d tab %s hid %d (+%d learnt)\n", npc, tostring(filter), n, learnt)) end
+  HIDE.sig = grid:GetNumItems() .. "|" .. npc .. "|" .. tostring(filter) .. "|" .. HIDE.hookCount
+  if HIDE.hookCount ~= HIDE.lastHook then HIDE.recheckAt = now() + 0.15 end   -- cell display data can arrive a little later
+  HIDE.lastHook = HIDE.hookCount
+end
+
+-- ================================================================ sort on open + highlight (slow, 200 ms)
 local function taskBackpack()
   if inBattle or not stableWorld() then if bp.open then resetEntries(); bp.open = false end return end
-  local vm = nil
-  for _, v in ipairs(FindAllOf("JHMainCharacterBackpackInTeamVM") or {}) do if live(v) then vm = v end end
+  local vm = HIDE.vm
+  if not (vm and vm:IsValid()) then vm = nil; for _, v in ipairs(FindAllOf("JHMainCharacterBackpackInTeamVM") or {}) do if live(v) then vm = v end end end
   local shown = vm and vm:GetModuleVisibility()
   if not shown then if bp.open then resetEntries(); bp.open = false end return end
   local view = vm:GetPairView(); if not view or not view:IsValid() then return end
   if not reqCache then buildReqCache() end
   local cfgSort = iniNumber("default_sort", 4)
-  local hide = iniNumber("hide_unusable", 1) == 1
   local mark = iniNumber("highlight_better", 1) == 1
   local mode = iniNumber("better_mode", 0)
 
-  if not bp.open then bp.open = true; bp.sortDone = false; bp.openAt = now(); bp.npc = nil; bp.filter = nil; bp.removed = 0; bp.statCache = {} end
-  -- 1) sort once per opening (after the panel has had a moment to build)
+  if not bp.open then bp.open = true; bp.sortDone = false; bp.openAt = now(); bp.npc = nil; bp.filter = nil end
+  -- 1) sort once per opening (after the panel has had a moment to build); taskHide runs right after in the
+  --    same tick, so the rebuilt list is filtered before it is drawn
   if not bp.sortDone and now() - bp.openAt > 0.3 then
     bp.sortDone = true
     if iniNumber("auto_sort", 1) == 1 then
@@ -464,90 +675,16 @@ local function taskBackpack()
         view[BTN_SORT_EVT](view)
         print("[GamepadTweaks] backpack: 整理 (sort type " .. tostring(active) .. ")\n")
       end
+      HIDE.sig = nil
     end
   end
-  -- 2) focused character changed -> rebuild the list so items hidden for the previous one come back
+  -- 2) highlight better equipment on the visible entries
   local npc = focusedNpc()
-  if bp.npc ~= nil and npc ~= bp.npc then
-    resetEntries()
-    if bp.removed > 0 then vm:HandleBackpackBatchChange(); bp.removed = 0 end
-    bp.npc = npc
-    return
-  end
+  if bp.npc ~= nil and npc ~= bp.npc then resetEntries() end
   bp.npc = npc
-  local filter = activeFilter(vm, view)
-  if bp.filter ~= nil and filter ~= bp.filter then
-    -- the game rebuilds the list from source on a tab switch, so items hidden in 全部 come back by themselves
-    resetEntries(); bp.removed = 0
-    bp.filter = filter
-    return
-  end
-  bp.filter = filter
-  -- 3) hide what this character cannot use
-  local grid = view.GRID_ITEM
-  local items = gridItems(grid)
-  if hide then
-    local n = 0
-    for _, sp in ipairs(items) do
-      if sp:IsValid() and not sp.bOnlyForLayout and reqCache[sp.ItemDefId] and not canUse(sp.ItemDefId, npc) then grid:RemoveItem(sp); n = n + 1 end
-    end
-    -- the game's own judgement: an entry it renders greyed out (IMG_Not_Learnable shown; display data
-    -- "not_learnable":true) is a weapon / manual / item the focused character cannot use or learn
-    local vn = view:GetFName():ToString()
-    for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
-      if live(en) and en:GetFullName():find(vn, 1, true) then
-        local dim = false
-        pcall(function() local v = en.ItemDisplay.CMP.IMG_Not_Learnable:GetVisibility(); dim = (v ~= 1 and v ~= 2) end)
-        if dim then
-          local ok, sp = pcall(function() return en:GetBindedDataObj() end)
-          if ok and sp and sp:IsValid() and not sp.bOnlyForLayout then
-            -- double check against the entry's own display data so a recycled entry can never hide the wrong item
-            local js = ""; pcall(function() js = en.ItemDisplay:GetData():DataToString():ToString() end)
-            if js:find('"not_learnable":true', 1, true) and tonumber(js:match('"setting_id":(%d+)')) == sp.ItemDefId then
-              grid:RemoveItem(sp); n = n + 1
-            end
-          end
-        end
-      end
-    end
-    if n > 0 then bp.removed = bp.removed + n; print("[GamepadTweaks] backpack: hid " .. n .. " item(s) unusable by npc " .. npc .. "\n") end
-  end
-  -- 3b) "全部" tab only: hide learned manuals (学成), learned recipes (烹饪/锻造/缝制 图纸 学成) and quest items;
-  --     they stay visible in their own category tabs
-  if filter == 0 and iniNumber("tidy_all_tab", 1) == 1 then
-    local info = nil
-    pcall(function() for _, m in ipairs(FindAllOf("NPCManager") or {}) do if live(m) then info = m:GetNPCInfo(npc, false) end end end)
-    local n2 = 0
-    for _, sp in ipairs(gridItems(grid)) do
-      if sp:IsValid() and not sp.bOnlyForLayout then
-        local k = kindCache[sp.ItemDefId]
-        if k then
-          local drop = false
-          if k.sub == 60 then drop = true
-          elseif k.sub >= 30 and k.sub <= 38 and k.skill and info and info:IsValid() then
-            local ok, has = pcall(function() return info:HasSkillById(k.skill) end); drop = ok and has
-          end
-          if drop then grid:RemoveItem(sp); n2 = n2 + 1 end
-        end
-      end
-    end
-    local vn = view:GetFName():ToString()
-    for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
-      if live(en) and en:GetFullName():find(vn, 1, true) then
-        local js = ""; pcall(function() js = en.ItemDisplay:GetData():DataToString():ToString() end)
-        if js:find('"is_recipe":true', 1, true) and js:find('"is_acquired":true', 1, true) then
-          local ok, sp = pcall(function() return en:GetBindedDataObj() end)
-          if ok and sp and sp:IsValid() and not sp.bOnlyForLayout and tonumber(js:match('"setting_id":(%d+)')) == sp.ItemDefId then grid:RemoveItem(sp); n2 = n2 + 1 end
-        end
-      end
-    end
-    if n2 > 0 then bp.removed = bp.removed + n2; print("[GamepadTweaks] backpack: 全部 tab tidy, hid " .. n2 .. " learned/quest item(s)\n") end
-  end
-  -- 4) highlight better equipment on the visible entries
   if not mark then if next(bp.lit) then resetEntries() end return end
   local worn = wornStats(npc)
   local viewName = view:GetFName():ToString()
-  local seen = {}
   for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
     if live(en) and en:GetFullName():find(viewName, 1, true) then
       local key = en:GetAddress()
@@ -564,7 +701,7 @@ local function taskBackpack()
       local f = en.ItemDisplay.CMP.IMG_Focus
       if good then
         f:SetColorAndOpacity(highlightColor()); if f:GetVisibility() ~= 3 then f:SetVisibility(3) end
-        bp.lit[key] = en; seen[key] = true
+        bp.lit[key] = en
       elseif bp.lit[key] or f.ColorAndOpacity.G < 0.99 then
         f:SetColorAndOpacity(WHITE)
         local focused = false
@@ -577,23 +714,25 @@ local function taskBackpack()
 end
 
 -- ---------------------------------------------------------------- scheduler (100 ms tick)
+-- base tick 20 ms (one game-thread loop for everything; "every" is in ticks)
 local tasks = {
-  { every = 5,  fn = taskCursor },
-  { every = 3,  fn = taskMapFlag },
-  { every = 20, fn = taskVisited },
-  { every = 3,  fn = taskTeleport },
-  { every = 3,  fn = taskArrival },
-  { every = 10, fn = taskCmd },
-  { every = 2,  fn = taskScan },
-  { every = 30, fn = taskInteract },
-  { every = 3,  fn = taskBattle },
-  { every = 2,  fn = taskBackpack },
+  { every = 25,  fn = taskCursor },
+  { every = 15,  fn = taskMapFlag },
+  { every = 100, fn = taskVisited },
+  { every = 15,  fn = taskTeleport },
+  { every = 15,  fn = taskArrival },
+  { every = 50,  fn = taskCmd },
+  { every = 10,  fn = taskScan },
+  { every = 150, fn = taskInteract },
+  { every = 15,  fn = taskBattle },
+  { every = 10,  fn = taskBackpack },
+  { every = 1,   fn = taskHide },
 }
 local tick = 0
 local errCount = {}
 writeFile("map.flag", "0")
 writeFile("battle.flag", "0")
-LoopInGameThreadWithDelay(100, function()
+LoopInGameThreadWithDelay(20, function()
   tick = tick + 1
   for i, t in ipairs(tasks) do
     if tick % t.every == 0 then

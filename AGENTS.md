@@ -75,7 +75,8 @@ powershell -File tools\install.ps1
 6. UI 可见性要沿父链判断（`shownChain`），按钮自身 `IsVisible()` 为真并不代表在屏幕上（主菜单 1286 个按钮里只有 10 个真的显示）。
 7. `GetListItems()` 返回 Lua table，元素需要 `:get()` 解包；`TArray` 属性用 `:ForEach`。两者不要混用。
 8. **传送只调用 `ChangeSceneMap`**，它自己会开始加载；再调 `task:StartChangeMap()` 会加载两次并可能把角色放到地图外。到访点只记录角色在地面（`CharacterMovement` 非下坠、Walking/NavWalking）站稳 2 秒后的位置。
-9. 背包隐藏使用 `GRID_ITEM:RemoveItem(spec)`，只影响显示；切换角色时调用 `vm:HandleBackpackBatchChange()` 恢复。
+9. **调度基准是 20 ms**（`LoopInGameThreadWithDelay(20, …)`，`every` 以拍计）。背包隐藏在 `taskHide` 每拍运行；防闪烁依赖对 `BP_OnEntryInitialized_Event_0` 的 `RegisterHook`，回调里**只改格子透明度，不要改列表**（此时游戏正在遍历列表生成格子）。
+10. 背包隐藏使用 `GRID_ITEM:RemoveItem(spec)`，只影响显示；切换角色时调用 `vm:HandleBackpackBatchChange()` 恢复。
 
 ## 4. 用户偏好（务必保持）
 
