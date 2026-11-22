@@ -1,0 +1,26 @@
+# build output
+build/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.dll
+
+# runtime files (live in D:\TOOLS\AWSdata\WanderingSword, never commit)
+*.log
+*.flag
+*.req
+cmd.lua
+cmd_out.txt
+scan_*.txt
+cur.txt
+visited.txt
+npc_override.txt
+
+# game assets / captures
+cursor.png
+*.pak
+*.sav
+*.png
+!docs/img/*.png
