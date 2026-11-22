@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.5 loaded\n")
+print("[GamepadTweaks] v4.6 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -467,6 +467,25 @@ local function taskBackpack()
     for _, sp in ipairs(items) do
       if sp:IsValid() and not sp.bOnlyForLayout and reqCache[sp.ItemDefId] and not canUse(sp.ItemDefId, npc) then grid:RemoveItem(sp); n = n + 1 end
     end
+    -- the game's own judgement: an entry it renders greyed out (IMG_Not_Learnable shown; display data
+    -- "not_learnable":true) is a weapon / manual / item the focused character cannot use or learn
+    local vn = view:GetFName():ToString()
+    for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
+      if live(en) and en:GetFullName():find(vn, 1, true) then
+        local dim = false
+        pcall(function() local v = en.ItemDisplay.CMP.IMG_Not_Learnable:GetVisibility(); dim = (v ~= 1 and v ~= 2) end)
+        if dim then
+          local ok, sp = pcall(function() return en:GetBindedDataObj() end)
+          if ok and sp and sp:IsValid() and not sp.bOnlyForLayout then
+            -- double check against the entry's own display data so a recycled entry can never hide the wrong item
+            local js = ""; pcall(function() js = en.ItemDisplay:GetData():DataToString():ToString() end)
+            if js:find('"not_learnable":true', 1, true) and tonumber(js:match('"setting_id":(%d+)')) == sp.ItemDefId then
+              grid:RemoveItem(sp); n = n + 1
+            end
+          end
+        end
+      end
+    end
     if n > 0 then bp.removed = bp.removed + n; print("[GamepadTweaks] backpack: hid " .. n .. " item(s) unusable by npc " .. npc .. "\n") end
   end
   -- 4) highlight better equipment on the visible entries
@@ -513,7 +532,7 @@ local tasks = {
   { every = 2,  fn = taskScan },
   { every = 30, fn = taskInteract },
   { every = 3,  fn = taskBattle },
-  { every = 3,  fn = taskBackpack },
+  { every = 2,  fn = taskBackpack },
 }
 local tick = 0
 local errCount = {}
