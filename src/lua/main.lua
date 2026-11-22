@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.10 loaded\n")
+print("[GamepadTweaks] v4.12 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -723,8 +723,17 @@ end
 -- Moving focus: SideBar / Backpack = vm:ChangeNaviFocus(FName(key), 0, "") then :SetFocus() on the widget it
 -- returns (Backpack needs the SetFocus); Bottom = :SetFocus() on the first visible bottom button.
 -- Not gated by inBattle: battle.flag is also 1 on the overworld travel map, and the screen cannot open in a fight.
+-- v4.12, no flash for any input:
+--   * every tick Lua tells the xinput1_3 proxy (wsmod_nav_* exports) which inputs would lead into 属性/装备 from
+--     where the focus is: LT/RT everywhere, RIGHT on the side bar, UP on the bottom row (measured: these are
+--     the game's own widget navigation, not ChangeNaviFocus). The proxy hides those presses (d-pad and left
+--     stick) from the game and reports them in trig.req ("L" "R" "<" ">" "^" "v"); Lua jumps instead.
+--   * the backpack's left edge (and any other module-level move) goes through the VM's ChangeNaviFocus("Equip" /
+--     "Property"): a pre-hook rewrites the module key, so the game itself focuses our target directly.
+--   * fallback (older proxy / anything unforeseen): LT/RT via KeyDownStatus and bouncing off 属性/装备.
 local NAV = { team = nil, vm = nil, im = nil, findAt = 0, views = nil, open = false, cur = nil, stable = nil,
-  beforeBottom = "SideBar", lt = false, rt = false, want = nil, wantUntil = 0, pending = nil, pendingWhy = nil, tries = 0, lastTry = 0, cfg = true }
+  beforeBottom = "SideBar", lt = false, rt = false, want = nil, wantUntil = 0, pending = nil, pendingWhy = nil, tries = 0, lastTry = 0, cfg = true, flag = nil, mask = 0, self = false, hooked = false, rewrites = 0,
+  force = false, cells = nil, sideCell = nil, bpIdx = 0, memAt = 0 }
 local NAV_VIEWS = { { "SideBar", "BPMV_TeamSideBar2_C" }, { "Property", "BPMV_Team_Property_C" }, { "Equip", "BPMV_Team_Equip_V3_C" }, { "Backpack", "BPMV_PrimeTeamBackpack_C" } }
 local NAV_BTNS = { "BTN_FormatonOut", "BTN_QieCuo", "BTN_SongLi", "BTN_LiDui", "BTN_QingJiao", "BTN_MountPet" }   -- left to right
 local NAV_ORDER = { "SideBar", "Backpack", "Bottom" }
@@ -749,15 +758,68 @@ local function navHasBottom()
   return false
 end
 local function navFocus(target)
+  NAV.self = true
+  local ok, e = pcall(function()
   if target == "Bottom" then
     for _, bn in ipairs(NAV_BTNS) do local b = NAV.team[bn]; if b and b:IsValid() and b:IsVisible() then b:SetFocus(); return end end
     return
   end
   local w = NAV.vm:ChangeNaviFocus(FName(target), 0, "")
   if w and w:IsValid() then w:SetFocus() end
+  -- come back to where we were inside the region (same frame, so the default cell is never drawn focused)
+  if target == "SideBar" then
+    local c = NAV.sideCell
+    if c and c:IsValid() and c:IsVisible() then c:SetFocus() end
+  elseif target == "Backpack" then
+    local g = HIDE.grid
+    if g and g:IsValid() then
+      local n = g:GetNumItems()
+      if n > 0 then g:NavigateToIndex(math.min(NAV.bpIdx or 0, n - 1)) end
+    end
+  end
+  end)
+  NAV.self = false
+  if not ok then error(e) end
+end
+-- where a move into 属性/装备 should go instead, seen from the region we are in
+local function navInstead()
+  local base = NAV.want or NAV.stable or "SideBar"
+  if base == "SideBar" then return "Backpack" end
+  if base == "Backpack" then return "SideBar" end
+  return NAV.beforeBottom or "SideBar"
+end
+local function navHook()
+  if NAV.hooked then return end
+  NAV.hooked = true
+  local ok, e = pcall(function()
+    RegisterHook("/Script/NeoUI.NeoUIUniversalModuleVMBase:ChangeNaviFocus", function(self, id, scen, str)
+      if NAV.self or not NAV.open or not NAV.cfg then return end
+      local key = id:get():ToString()
+      if key ~= "Property" and key ~= "Equip" then return end
+      local t = navInstead()
+      if t == "Bottom" then t = "SideBar" end
+      id:set(FName(t))
+      NAV.rewrites = NAV.rewrites + 1
+      -- the game lands on the region's default element; next tick navFocus puts it on the remembered one
+      -- (Backpack also needs that SetFocus to take the focus at all)
+      NAV.want, NAV.wantUntil, NAV.tries, NAV.lastTry, NAV.force = t, now() + (t == "SideBar" and 0.6 or 0.3), 0, 0, true
+      print(string.format("[GamepadTweaks] nav: game asked for %s, sent to %s\n", key, t))
+    end)
+  end)
+  print("[GamepadTweaks] nav: ChangeNaviFocus hook " .. (ok and "registered" or ("failed: " .. tostring(e))) .. "\n")
+end
+-- "arrived": for the side bar also on the remembered cell (the game re-focuses its default cell a moment
+-- after the module gets the focus, so we keep putting it back while the move is held)
+local function navAt(target, cur)
+  if cur ~= target then return false end
+  if target == "SideBar" then
+    local c = NAV.sideCell
+    if c and c:IsValid() and c:IsVisible() then return c:HasFocusedDescendants() end
+  end
+  return true
 end
 local function navGo(target, why)
-  NAV.want, NAV.wantUntil, NAV.tries, NAV.lastTry = target, now() + 0.3, 0, 0
+  NAV.want, NAV.wantUntil, NAV.tries, NAV.lastTry, NAV.force = target, now() + (target == "SideBar" and 0.6 or 0.3), 0, 0, true
   print(string.format("[GamepadTweaks] nav %s -> %s (%s)\n", tostring(NAV.stable), target, why))
 end
 local function navTriggers()
@@ -765,19 +827,56 @@ local function navTriggers()
   NAV.im.KeyDownStatus:ForEach(function(k, v) local key = k:get(); if key == 11 then lt = v:get() elseif key == 12 then rt = v:get() end end)
   return lt, rt
 end
+local NAVX = nil      -- wsmod_nav_* exports of the proxy (nil = older proxy)
+do
+  local fns = {}
+  for _, n in ipairs({ "begin", "up", "down", "left", "right", "trig", "commit" }) do fns[n] = package.loadlib(DLLPATH, "wsmod_nav_" .. n) end
+  if fns.begin and fns.commit then NAVX = fns end
+  print("[GamepadTweaks] nav: proxy input filter " .. (NAVX and "available" or "missing (old xinput1_3.dll, LT/RT only)") .. "\n")
+end
+local NAV_BITS = { up = 1, down = 2, left = 4, right = 8, trig = 16 }
+local function navMask(m)
+  if NAVX then
+    if m ~= 0 or NAV.mask ~= 0 then
+      NAVX.begin()
+      for n, b in pairs(NAV_BITS) do if m & b ~= 0 then NAVX[n]() end end
+      NAVX.commit()                       -- refreshed every tick while non-zero; the proxy drops it after 300 ms
+    end
+  else
+    local on = m ~= 0
+    if on ~= NAV.flag then NAV.flag = on; writeFile("prime.flag", on and "1" or "0") end
+  end
+  NAV.mask = m
+end
+local function navFlag(on) if not on then navMask(0) end end
+-- "L"/"R" events from the proxy (renamed first so an append racing with the read is never lost)
+local function navPadEvents()
+  if not os.rename(DIR .. "trig.req", DIR .. "trig.take") then return nil end
+  local s = readFirst("trig.take") or ""; os.remove(DIR .. "trig.take")
+  return s
+end
+local function navStep(base, d)
+  local i = NAV_IDX[base] or 1
+  local target = NAV_ORDER[(i - 1 + d) % 3 + 1]
+  if target == "Bottom" and not navHasBottom() then target = NAV_ORDER[(i - 1 + 2 * d) % 3 + 1] end
+  return target
+end
 local function taskNav()
   local t = NAV.team
   if not (t and t:IsValid()) then
+    navFlag(false)
     if now() < NAV.findAt then return end
     NAV.findAt = now() + 1
     t = nil; for _, v in ipairs(FindAllOf("BPMV_PrimeTeam_C") or {}) do if live(v) then t = v end end
     NAV.team, NAV.open = t, false
     if not t then return end
   end
-  if not t:IsVisible() then NAV.open = false return end
+  if not t:IsVisible() then NAV.open = false; navFlag(false); navPadEvents() return end
   if not NAV.open then
     NAV.open, NAV.cur, NAV.stable, NAV.want, NAV.pending, NAV.beforeBottom = true, nil, nil, nil, nil, "SideBar"
+    NAV.cells, NAV.sideCell, NAV.bpIdx, NAV.force = nil, nil, 0, false
     NAV.cfg = iniNumber("prime_skip_panels", 1) == 1
+    if NAV.cfg then navHook() end
     NAV.vm = t:GetNeoUIVM()
     NAV.im = nil; for _, s in ipairs(FindAllOf("NeoUISubsystem") or {}) do if live(s) then NAV.im = s.InputManager end end
     NAV.views = {}
@@ -787,8 +886,19 @@ local function taskNav()
     NAV.lt, NAV.rt = false, false
     pcall(function() NAV.lt, NAV.rt = navTriggers() end)
   end
-  if not NAV.cfg or not (NAV.vm and NAV.vm:IsValid() and NAV.im and NAV.im:IsValid()) then return end
+  if not NAV.cfg or not (NAV.vm and NAV.vm:IsValid() and NAV.im and NAV.im:IsValid()) then navFlag(false) return end
   local cur = navRegion()
+  local ev = navPadEvents()
+  if ev and (NAV.mask ~= 0 or NAV.flag) then
+    for ch in ev:gmatch("[LR<>%^v]") do
+      local base = NAV.want or NAV.stable or (NAV_IDX[cur] and cur) or "SideBar"
+      NAV.pending = nil
+      if ch == "L" or ch == "R" then navGo(navStep(base, ch == "R" and 1 or -1), ch .. "T pad")
+      elseif ch == ">" and base == "SideBar" then navGo("Backpack", "right pad")
+      elseif ch == "^" and base == "Bottom" then navGo(NAV.beforeBottom or "SideBar", "up pad")
+      elseif ch == "<" and base == "Backpack" then navGo("SideBar", "left pad") end
+    end
+  end
   local lt, rt = navTriggers()
   local pressed = 0
   if rt and not NAV.rt then pressed = 1 elseif lt and not NAV.lt then pressed = -1 end
@@ -798,10 +908,7 @@ local function taskNav()
   -- target is chosen on press and applied on release; navGo then holds it for 0.3 s against late moves
   if pressed ~= 0 and cur and pad then
     local base = NAV.stable or (NAV_IDX[cur] and cur) or "SideBar"
-    local i = NAV_IDX[base]
-    local target = NAV_ORDER[(i - 1 + pressed) % 3 + 1]
-    if target == "Bottom" and not navHasBottom() then target = NAV_ORDER[(i - 1 + 2 * pressed) % 3 + 1] end
-    NAV.pending, NAV.pendingWhy, NAV.want = target, pressed > 0 and "RT" or "LT", nil
+    NAV.pending, NAV.pendingWhy, NAV.want = navStep(base, pressed), pressed > 0 and "RT" or "LT", nil
   end
   if NAV.pending and not (lt or rt) then navGo(NAV.pending, NAV.pendingWhy); NAV.pending = nil end
   if not NAV.pending and not NAV.want and not (lt or rt) and pad and (cur == "Property" or cur == "Equip") then
@@ -812,8 +919,9 @@ local function taskNav()
     if now() > NAV.wantUntil then
       if cur ~= NAV.want then print(string.format("[GamepadTweaks] nav: gave up on %s (at %s)\n", NAV.want, tostring(cur))) end
       NAV.want = nil
-    elseif cur ~= NAV.want and NAV.tries < 8 and now() - NAV.lastTry >= 0.035 then
-      NAV.tries, NAV.lastTry = NAV.tries + 1, now()
+    elseif (NAV.force or not navAt(NAV.want, cur)) and NAV.tries < 12 and now() - NAV.lastTry >= 0.035 then
+      if not NAV.force and cur == NAV.want then print(string.format("[GamepadTweaks] nav: %s re-applied (try %d)\n", NAV.want, NAV.tries + 1)) end
+      NAV.tries, NAV.lastTry, NAV.force = NAV.tries + 1, now(), false
       pcall(navFocus, NAV.want)
       cur = navRegion()
     end
@@ -821,7 +929,38 @@ local function taskNav()
   if cur and NAV_IDX[cur] and not NAV.want and not NAV.pending then
     if cur == "Bottom" and NAV.stable and NAV.stable ~= "Bottom" then NAV.beforeBottom = NAV.stable end
     NAV.stable = cur
+    if (cur == "SideBar" or cur == "Backpack") and now() - NAV.memAt > 0.06 then
+      NAV.memAt = now()
+      pcall(function()
+        if cur == "SideBar" then
+          if not NAV.cells then
+            NAV.cells = {}
+            for _, c in ipairs(FindAllOf("BPVE_SideBarCell2_C") or {}) do if live(c) then NAV.cells[#NAV.cells + 1] = c end end
+          end
+          local c = NAV.sideCell
+          if not (c and c:IsValid() and c:IsVisible() and c:HasFocusedDescendants()) then
+            for _, x in ipairs(NAV.cells) do if x:IsValid() and x:IsVisible() and x:HasFocusedDescendants() then NAV.sideCell = x; break end end
+          end
+        else
+          local g = HIDE.grid
+          if g and g:IsValid() and HIDE.vn then
+            for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
+              if en:IsValid() and en:IsVisible() and en:HasFocusedDescendants() and en:GetFullName():find(HIDE.vn, 1, true) then
+                local i = g:GetIndexForItem(en:GetBindedDataObj()); if i and i >= 0 then NAV.bpIdx = i end
+                break
+              end
+            end
+          end
+        end
+      end)
+    end
   end
+  local r = NAV.want or cur
+  local m = 0
+  if r == "SideBar" or r == "Backpack" or r == "Bottom" or r == "Property" or r == "Equip" then m = NAV_BITS.trig end
+  if r == "SideBar" then m = m | NAV_BITS.right elseif r == "Bottom" then m = m | NAV_BITS.up end
+  if not pad then m = 0 end
+  navMask(m)
   NAV.cur = cur
 end
 
@@ -845,6 +984,7 @@ local tick = 0
 local errCount = {}
 writeFile("map.flag", "0")
 writeFile("battle.flag", "0")
+writeFile("prime.flag", "0"); os.remove(DIR .. "trig.req")
 LoopInGameThreadWithDelay(20, function()
   tick = tick + 1
   for i, t in ipairs(tasks) do

@@ -70,6 +70,10 @@
 - 游戏原生：RT 头像→属性→装备→背包（到背包停住），LT 背包→装备→属性（到属性停住）；属性按左→头像，头像按右→属性；属性连按下 5 次→底部按钮；底部按上或 RT→属性，LT 不动。**LT/RT 在松开时才切换**。
 - 程序跳转：`vm = team:GetNeoUIVM()`，`w = vm:ChangeNaviFocus(FName(key), 0, "")` 返回目标控件，**再对它 `:SetFocus()`**（背包必须这样，头像/属性/装备只调 ChangeNaviFocus 也行）。底部按钮：对按钮本身 `:SetFocus()`。`EVT_FocusMountBtn()`、`FocusWidgetForScenario_Direct` 都不移动焦点。
 - 扳机状态：`NeoUISubsystem.InputManager.KeyDownStatus`（map，key 为数字），11 = LT，12 = RT；`InputManager:IsGamepadMode()` 区分手柄/键鼠模式。
+- **哪些移动经过 `ChangeNaviFocus`**（在 `/Script/NeoUI.NeoUIUniversalModuleVMBase:ChangeNaviFocus` 上 `RegisterHook` 实测）：背包最左列往左 = `ChangeNaviFocus("Equip", 3)`，可以在钩子里 `id:set(FName(...))` 改写目标；头像栏往右、底部按钮往上是 Slate 控件导航，**不经过** ChangeNaviFocus，只能在输入层拦截。把属性/装备设为 HitTestInvisible 对导航没有影响。
+- `KeyDownStatus` 的 key：1 左 2 上 3 右 4 下 8 A 11 LT 12 RT（十字键）；左摇杆不出现在这里。
+- 背包格子：`GRID_ITEM:NavigateToIndex(i)` 把焦点放到第 i 格（`SetSelectedIndex` 不移动焦点），每行 6 格，`GetIndexForItem(spec)` 取当前格序号。
+- 头像栏格子 `BPVE_SideBarCell2_C`（内部按钮 `BTN_SidebarCell`），`:SetFocus()` 可选中指定头像；模块刚拿到焦点后游戏会在约一两帧内再把焦点放回默认头像，需要再设一次。
 - 大地图（行走地图）上 pawn 是 `BP_WorldHero1_C`，模组的 `battle.flag` 此时也是 1；真正战斗是 `BP_FightSpectator_C` 或战斗技能栏可见。
 
 ## 物品与装备

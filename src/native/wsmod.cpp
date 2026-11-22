@@ -59,6 +59,25 @@ static void LoadConfig() {
 static volatile LONG g_primary = -1;
 static volatile LONG g_mapOpen = 0;
 static volatile LONG g_battle = 0;    // in battle: everything native, mod pointer off
+// character screen: Lua tells us (wsmod_nav_* exports, refreshed every tick) which inputs would move the
+// focus into 属性/装备 from where it is now. Those presses are hidden from the game and reported to Lua in
+// trig.req ("L"/"R" = LT/RT, "<" ">" "^" "v" = d-pad or left stick), Lua then jumps itself -> no flash.
+enum { NAV_UP = 1, NAV_DOWN = 2, NAV_LEFT = 4, NAV_RIGHT = 8, NAV_TRIG = 16 };
+static volatile LONG g_navMask = 0, g_navStage = 0; static volatile DWORD g_navTime = 0;
+static volatile LONG g_ev[6];          // L R < > ^ v
+static const char EV_CH[6] = { 'L', 'R', '<', '>', '^', 'v' };
+static LONG NavMask() { return (GetTickCount() - g_navTime < 300) ? g_navMask : 0; }   // stale -> nothing blocked
+extern "C" __declspec(dllexport) int wsmod_nav_begin(void*) { g_navStage = 0; return 0; }
+extern "C" __declspec(dllexport) int wsmod_nav_up(void*) { g_navStage |= NAV_UP; return 0; }
+extern "C" __declspec(dllexport) int wsmod_nav_down(void*) { g_navStage |= NAV_DOWN; return 0; }
+extern "C" __declspec(dllexport) int wsmod_nav_left(void*) { g_navStage |= NAV_LEFT; return 0; }
+extern "C" __declspec(dllexport) int wsmod_nav_right(void*) { g_navStage |= NAV_RIGHT; return 0; }
+extern "C" __declspec(dllexport) int wsmod_nav_trig(void*) { g_navStage |= NAV_TRIG; return 0; }
+extern "C" __declspec(dllexport) int wsmod_nav_commit(void*) {
+    LONG m = g_navStage;
+    if (m != g_navMask) Log("nav mask %s%s%s%s%s", m & NAV_TRIG ? "T" : "-", m & NAV_UP ? "U" : "-", m & NAV_DOWN ? "D" : "-", m & NAV_LEFT ? "L" : "-", m & NAV_RIGHT ? "R" : "-");
+    InterlockedExchange(&g_navMask, m); g_navTime = GetTickCount(); return 0;
+}
 static volatile double g_uiScale = 1.0;   // game client height / 1080
 static volatile LONG g_menuOpen = 0;
 static HWND g_menuWnd;
@@ -279,6 +298,12 @@ static DWORD WINAPI MouseThread(LPVOID) {
     for (;;) {
         Sleep(8);
         DWORD now = GetTickCount(); double dt = (now - last) / 1000.0; last = now; if (dt > 0.05) dt = 0.05;
+        { LONG any = 0, n[6];
+          for (int k = 0; k < 6; k++) { n[k] = InterlockedExchange(&g_ev[k], 0); any |= n[k]; }
+          if (any) {
+            FILE* tf = nullptr;
+            if (_wfopen_s(&tf, DATA_DIR L"trig.req", L"ab") == 0 && tf) { for (int k = 0; k < 6; k++) for (LONG i = 0; i < n[k]; i++) fputc(EV_CH[k], tf); fclose(tf); }
+          } }
         if ((++n % 25) == 0) {
             std::wstring s = ReadSmallFile(L"map.flag");
             LONG nm = (!s.empty() && s[0] == L'1') ? 1 : 0;
@@ -688,6 +713,36 @@ static void PadPointerClick(XINPUT_GAMEPAD& g) {
     g_prevA = a;
     if (g_aClick) g.wButtons &= ~XINPUT_GAMEPAD_A;
 }
+// one input = one state machine: 0 idle, 1 pressed while allowed (game sees it), 2 pressed while blocked
+// (hidden until released, even if the block is lifted meanwhile - otherwise the game would see a late press)
+static int g_in[6];
+static bool InputStep(int k, bool down, bool blocked) {
+    if (!down) { g_in[k] = 0; return false; }
+    if (g_in[k] == 0) { g_in[k] = blocked ? 2 : 1; if (blocked) InterlockedIncrement(&g_ev[k]); }
+    return g_in[k] == 2;
+}
+static void PadPrime(XINPUT_GAMEPAD& g) {
+    LONG m = NavMask();
+    // triggers (hysteresis)
+    bool l = g_in[0] ? g.bLeftTrigger > 40 : g.bLeftTrigger > 120;
+    bool r = g_in[1] ? g.bRightTrigger > 40 : g.bRightTrigger > 120;
+    if (InputStep(0, l, (m & NAV_TRIG) != 0)) g.bLeftTrigger = 0;
+    if (InputStep(1, r, (m & NAV_TRIG) != 0)) g.bRightTrigger = 0;
+    // directions: d-pad OR left stick (stick counts from 16000, released below 7000)
+    struct D { int k; WORD bit; int axis; int sign; LONG flag; } dirs[4] = {
+        { 2, XINPUT_GAMEPAD_DPAD_LEFT, 0, -1, NAV_LEFT }, { 3, XINPUT_GAMEPAD_DPAD_RIGHT, 0, 1, NAV_RIGHT },
+        { 4, XINPUT_GAMEPAD_DPAD_UP, 1, 1, NAV_UP },     { 5, XINPUT_GAMEPAD_DPAD_DOWN, 1, -1, NAV_DOWN } };
+    for (auto& d : dirs) {
+        SHORT& ax = d.axis ? g.sThumbLY : g.sThumbLX;
+        int v = ax * d.sign;
+        bool stick = g_in[d.k] ? v > 7000 : v > 16000;
+        bool down = (g.wButtons & d.bit) || stick;
+        if (InputStep(d.k, down, (m & d.flag) != 0)) {
+            g.wButtons &= ~d.bit;
+            if (v > 0) ax = 0;                  // only the component pointing that way
+        }
+    }
+}
 static void ReleaseClick() { if (g_aClick) { MouseBtn(false); g_aClick = false; } }
 static DWORD Handle(PFN_GetState fn, DWORD idx, XINPUT_STATE* s) {
     if (!fn) return ERROR_DEVICE_NOT_CONNECTED;
@@ -697,6 +752,7 @@ static DWORD Handle(PFN_GetState fn, DWORD idx, XINPUT_STATE* s) {
     if ((LONG)idx != g_primary) return r;
     XINPUT_GAMEPAD& g = s->Gamepad;
     bool focus = GameFocused();
+    if (focus && !g_menuOpen) PadPrime(g);
     if (focus && !g_battle) { if (!g_menuOpen) PadSpeedCombo(g); PadMenu(g); }
     if (g_menuOpen) { ReleaseClick(); ZeroMemory(&g, sizeof(g)); return r; }                    // panel owns the pad
     if (g_battle) { ReleaseClick(); g_ptrMode = 0; g_prevA = false; g_prevStart = (g.wButtons & XINPUT_GAMEPAD_START) != 0; return r; } // battle: all native

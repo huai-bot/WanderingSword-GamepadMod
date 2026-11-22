@@ -59,6 +59,9 @@ Write-Host ("start: " + (Lua $probe))
 # make sure the game is in gamepad mode (a d-pad press inside the side bar does that)
 $null = Pad "DOWN 120"; Start-Sleep -Milliseconds 300; $null = Pad "UP 120"; Start-Sleep -Milliseconds 400
 Write-Host ("after wake-up: " + (Lua $probe))
+$toSide = 'local function live(o) if not o or not o:IsValid() then return false end local ok, n = pcall(function() return o:GetFName():ToString() end) return ok and not n:find("^Default__") end; local team; for _, v in ipairs(FindAllOf("BPMV_PrimeTeam_C") or {}) do if live(v) then team = v end end; local w = team:GetNeoUIVM():ChangeNaviFocus(FName("SideBar"), 0, ""); if w and w:IsValid() then w:SetFocus() end; W("side")'
+$null = Lua $toSide; Start-Sleep -Milliseconds 600
+Write-Host ("reset to: " + (Lua $probe))
 
 Write-Host "--- RT cycle"
 Check "RT" "Backpack"; Check "RT" "Bottom"; Check "RT" "SideBar"; Check "RT" "Backpack"

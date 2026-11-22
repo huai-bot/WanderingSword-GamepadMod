@@ -72,6 +72,8 @@ powershell -File tools\install.ps1
 - 手柄休眠断开后游戏不再读取 XInput：创建 `pad_connect.flag`（让 0 号手柄报告已连接）并给游戏窗口发 `WM_DEVICECHANGE`（0x219, wParam 7）。
 - `hot_reload.ps1`：游戏在前台时发 Ctrl+R 热重载并等日志；`install_reload.ps1`：游戏内语法检查 → 安装 → 关闭人物界面 → 热重载。
 - `nav_verify.ps1`：人物界面切区回归测试（每步读区域 + 截图）。
+- `wspad` 新版本支持左摇杆（`SL/SR/SU/SD`），脚本运行中检测到真实手柄有输入会立即中止（写 `pad_user.flag`）。2026-11-23 重启游戏后注入的十字键不再生效（左摇杆正常，原因未查明），区域内移动用左摇杆测。
+- `nav_verify2.ps1`：v4.12 回归测试（LT/RT 循环、十字键/左摇杆出入各边缘、位置记忆），同时检查日志里没有「d-pad into」即焦点没进过属性/装备。
 
 ## 3. 必须遵守的规则（都是踩过的坑）
 
@@ -86,7 +88,7 @@ powershell -File tools\install.ps1
 9. **调度基准是 20 ms**（`LoopInGameThreadWithDelay(20, …)`，`every` 以拍计）。背包隐藏在 `taskHide` 每拍运行；防闪烁依赖对 `BP_OnEntryInitialized_Event_0` 的 `RegisterHook`，回调里**只改格子透明度，不要改列表**（此时游戏正在遍历列表生成格子）。
 10. 背包隐藏使用 `GRID_ITEM:RemoveItem(spec)`，只影响显示；切换角色时调用 `vm:HandleBackpackBatchChange()` 恢复。
 
-11. **人物界面切区（`taskNav`）**：游戏的 LT/RT 在松开时才移动焦点，所以按下时选目标、松开后再跳，并在 0.3 秒内守住目标；只在手柄模式（`IsGamepadMode()`）下纠正，避免和鼠标悬停抢焦点。跳到背包必须对 `ChangeNaviFocus` 的返回值再 `SetFocus()`。
+11. **人物界面切区（`taskNav`，v4.12）**：Lua 每拍通过 `wsmod_nav_*` 导出函数告诉代理 DLL 当前哪些输入会走进属性/装备（任意位置 LT/RT、头像栏右、底部按钮上），代理把这些按键（十字键和左摇杆）藏起来写进 `trig.req`，Lua 再自己跳；背包左边缘靠 `ChangeNaviFocus` 钩子改写目标。300 ms 没刷新掩码代理就恢复放行，Lua 卡住不会锁死手柄。自己调用 `ChangeNaviFocus` 时置 `NAV.self` 以免被钩子改写。只在手柄模式（`IsGamepadMode()`）下工作。
 12. `inBattle`（= `battle.flag`）在大地图上也为真；只在**真正战斗**时停用的功能用 `inFight`。
 
 ## 4. 用户偏好（务必保持）

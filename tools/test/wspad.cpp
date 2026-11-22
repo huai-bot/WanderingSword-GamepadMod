@@ -14,6 +14,7 @@
 #include <delayimp.h>
 #include <psapi.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -34,12 +35,23 @@ static volatile LONG g_btn = 0, g_lt = 0, g_rt = 0, g_active = 0, g_pk = 0, g_ca
 // while DATA\pad_connect.flag exists, pad 0 reports "connected" even if the real controller is asleep
 // (UE stops polling a disconnected pad until it gets WM_DEVICECHANGE; the driver posts one after creating the flag)
 static volatile LONG g_hold = 0;
+// left stick: 0 none, 1 left, 2 right, 3 up, 4 down (full tilt)
+static volatile LONG g_stick = 0;
+// the real controller is being used: abort the script at once and write DATA\pad_user.flag
+static volatile LONG g_user = 0;
 static HANDLE g_thread = nullptr;
 
 static void Apply(DWORD i, XINPUT_STATE* s, DWORD& r) {
     InterlockedIncrement(&g_calls);
     if (!(g_active || g_hold) || i != 0 || !s) return;
+    if (r == ERROR_SUCCESS && g_active) {
+        const XINPUT_GAMEPAD& q = s->Gamepad;
+        if (q.wButtons || q.bLeftTrigger > 30 || q.bRightTrigger > 30 || abs(q.sThumbLX) > 9000 || abs(q.sThumbLY) > 9000 ||
+            abs(q.sThumbRX) > 9000 || abs(q.sThumbRY) > 9000) InterlockedExchange(&g_user, 1);
+    }
     if (r != ERROR_SUCCESS) { ZeroMemory(s, sizeof(XINPUT_STATE)); r = ERROR_SUCCESS; }
+    switch (g_stick) { case 1: s->Gamepad.sThumbLX = -32000; break; case 2: s->Gamepad.sThumbLX = 32000; break;
+                       case 3: s->Gamepad.sThumbLY = 32000; break; case 4: s->Gamepad.sThumbLY = -32000; break; }
     s->Gamepad.wButtons |= (WORD)g_btn;
     if (g_lt) s->Gamepad.bLeftTrigger = 255;
     if (g_rt) s->Gamepad.bRightTrigger = 255;
@@ -110,6 +122,7 @@ static int PatchModule(HMODULE m) {
     return n;
 }
 
+static LONG g_stickReq = 0;
 static WORD BtnBit(const std::string& t, bool& lt, bool& rt) {
     if (t == "A") return XINPUT_GAMEPAD_A; if (t == "B") return XINPUT_GAMEPAD_B;
     if (t == "X") return XINPUT_GAMEPAD_X; if (t == "Y") return XINPUT_GAMEPAD_Y;
@@ -119,6 +132,8 @@ static WORD BtnBit(const std::string& t, bool& lt, bool& rt) {
     if (t == "START") return XINPUT_GAMEPAD_START; if (t == "BACK") return XINPUT_GAMEPAD_BACK;
     if (t == "LS") return XINPUT_GAMEPAD_LEFT_THUMB; if (t == "RS") return XINPUT_GAMEPAD_RIGHT_THUMB;
     if (t == "LT") { lt = true; return 0; } if (t == "RT") { rt = true; return 0; }
+    if (t == "SL") { g_stickReq = 1; return 0; } if (t == "SR") { g_stickReq = 2; return 0; }
+    if (t == "SU") { g_stickReq = 3; return 0; } if (t == "SD") { g_stickReq = 4; return 0; }
     return 0;
 }
 static bool InBattle() {
@@ -130,7 +145,7 @@ static void WriteOut(const char* s) {
 }
 static void RunScript(const std::string& text) {
     LONG c0 = g_calls; int steps = 0; char msg[160];
-    InterlockedExchange(&g_active, 1);
+    InterlockedExchange(&g_user, 0); InterlockedExchange(&g_active, 1);
     size_t p = 0;
     while (p < text.size()) {
         size_t e = text.find('\n', p); if (e == std::string::npos) e = text.size();
@@ -141,11 +156,14 @@ static void RunScript(const std::string& text) {
         std::string keys = line.substr(0, sp); int ms = sp == std::string::npos ? 120 : atoi(line.c_str() + sp + 1);
         if (ms < 10) ms = 10; if (ms > 5000) ms = 5000;
         if (InBattle()) { InterlockedExchange(&g_btn, 0); g_lt = g_rt = 0; InterlockedExchange(&g_active, 0); sprintf_s(msg, "ABORT flag at step %d", steps); WriteOut(msg); Log("%s", msg); return; }
-        bool lt = false, rt = false; WORD b = 0;
+        if (g_user) { InterlockedExchange(&g_btn, 0); g_lt = g_rt = 0; g_stick = 0; InterlockedExchange(&g_active, 0);
+            FILE* uf = nullptr; if (_wfopen_s(&uf, DATA L"pad_user.flag", L"wb") == 0 && uf) fclose(uf);
+            sprintf_s(msg, "ABORT user input at step %d", steps); WriteOut(msg); Log("%s", msg); InterlockedExchange(&g_user, 0); return; }
+        bool lt = false, rt = false; WORD b = 0; g_stickReq = 0;
         if (keys != "-") { size_t q = 0; while (q <= keys.size()) { size_t z = keys.find('+', q); if (z == std::string::npos) z = keys.size(); b |= BtnBit(keys.substr(q, z - q), lt, rt); q = z + 1; } }
-        InterlockedExchange(&g_btn, b); InterlockedExchange(&g_lt, lt); InterlockedExchange(&g_rt, rt); InterlockedIncrement(&g_pk);
+        InterlockedExchange(&g_btn, b); InterlockedExchange(&g_lt, lt); InterlockedExchange(&g_rt, rt); InterlockedExchange(&g_stick, g_stickReq); InterlockedIncrement(&g_pk);
         Sleep(ms);
-        InterlockedExchange(&g_btn, 0); InterlockedExchange(&g_lt, 0); InterlockedExchange(&g_rt, 0); InterlockedIncrement(&g_pk);
+        InterlockedExchange(&g_btn, 0); InterlockedExchange(&g_lt, 0); InterlockedExchange(&g_rt, 0); InterlockedExchange(&g_stick, 0); InterlockedIncrement(&g_pk);
         if (keys != "-") Sleep(40);
         steps++;
     }
