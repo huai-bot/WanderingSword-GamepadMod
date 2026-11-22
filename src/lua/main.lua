@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.3 loaded\n")
+print("[GamepadTweaks] v4.4 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -61,20 +61,61 @@ local function taskMapFlag()
   if v ~= lastMap then lastMap = v; writeFile("map.flag", v) end
 end
 
--- ---------------------------------------------------------------- 3) visited levels
-local visited = {}
-do local s = readFirst("visited.txt"); if s then for line in s:gmatch("[^\n]+") do local lv = line:match("^([^|]+)|"); if lv then visited[lv] = line end end end end
-local function taskVisited()
-  local pc, pawn, lv, full = stableWorld(); if not pawn then return end
-  if not full:find("BP_SceneHero") or visited[lv] then return end
-  local l = pawn:K2_GetActorLocation()
-  visited[lv] = string.format("%s|%.0f|%.0f|%.0f", lv, l.X, l.Y, l.Z)
-  local t = {} for _, x in pairs(visited) do table.insert(t, x) end table.sort(t)
+-- ---------------------------------------------------------------- 3) visited levels -> safe landing points
+-- A level is "visited" once the hero has stood on the ground there for 2 s. The stored point is refreshed
+-- (at most every 20 s) to where the hero last stood on solid ground, so it is always a real walkable spot.
+-- (v4.3 stored the very first position after a load, which can be a staging point in the air/under the map.)
+local visited = {}          -- lv -> { x, y, z }
+do
+  local s = readFirst("visited.txt")
+  local byPos = {}
+  if s then for line in s:gmatch("[^\n]+") do
+    local lv, x, y, z = line:match("^([^|]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)")
+    if lv then visited[lv] = { x = tonumber(x), y = tonumber(y), z = tonumber(z) }; local k = x .. "|" .. y .. "|" .. z; byPos[k] = (byPos[k] or 0) + 1 end
+  end end
+  -- identical coordinates in two different levels cannot both be real: drop them, they get re-recorded
+  for lv, p in pairs(visited) do
+    local k = string.format("%.0f|%.0f|%.0f", p.x, p.y, p.z)
+    if (byPos[k] or 0) > 1 then visited[lv] = nil; print("[GamepadTweaks] visited: dropped suspicious point for " .. lv .. "\n") end
+  end
+end
+local function saveVisited()
+  local t = {} for lv, p in pairs(visited) do t[#t + 1] = string.format("%s|%.0f|%.0f|%.0f", lv, p.x, p.y, p.z) end table.sort(t)
   writeFile("visited.txt", table.concat(t, "\n") .. "\n")
-  print("[GamepadTweaks] visited " .. lv .. "\n")
+end
+saveVisited()
+local ground = { lv = nil, since = 0, lastSave = 0 }
+local function onGround(pawn)
+  local m = pawn.CharacterMovement
+  if not m or not m:IsValid() or m:IsFalling() then return false end
+  local mode = m.MovementMode
+  return mode == 1 or mode == 2      -- Walking / NavWalking
+end
+local function taskVisited()
+  local pc, pawn, lv, full = stableWorld(); if not pawn then ground.lv = nil return end
+  if not full:find("BP_SceneHero") then ground.lv = nil return end
+  if not onGround(pawn) then ground.lv = nil return end
+  if ground.lv ~= lv then ground.lv = lv; ground.since = now() return end
+  if now() - ground.since < 2 then return end
+  local l = pawn:K2_GetActorLocation()
+  local p = visited[lv]
+  if not p then
+    visited[lv] = { x = l.X, y = l.Y, z = l.Z }; saveVisited(); ground.lastSave = now()
+    print("[GamepadTweaks] visited " .. lv .. "\n")
+  elseif now() - ground.lastSave > 20 and ((l.X - p.x) ^ 2 + (l.Y - p.y) ^ 2 + (l.Z - p.z) ^ 2) > 300 * 300 then
+    p.x, p.y, p.z = l.X, l.Y, l.Z; saveVisited(); ground.lastSave = now()
+  end
 end
 
 -- ---------------------------------------------------------------- 4) teleport request "LEVEL|x|y|z"
+-- ChangeSceneMap already starts the load; calling task:StartChangeMap() as well loaded the map twice (v4.3 bug).
+-- After arrival a watchdog checks the hero for 25 s; if it is falling / below the target / gone, it is moved
+-- to the level's PlayerStart (the game's own spawn point).
+local arrival = nil   -- { lv, z, at, fallSince, rescued }
+local function changeMap(pc, lv, x, y, z)
+  local cdo = StaticFindObject("/Script/JH.Default__AsyncTaskChangeSceneMap")
+  return cdo:ChangeSceneMap(pc, FName(lv), { X = x, Y = y, Z = z }, 0, true, true, true, true, false)
+end
 local function taskTeleport()
   local line = readFirst("teleport.req"); if not line then return end
   os.remove(DIR .. "teleport.req")
@@ -89,12 +130,48 @@ local function taskTeleport()
     pcall(function() local d = ui:GetDialogView(); if d and d:IsValid() and d:IsVisible() then blocked = true end end)
   end
   if blocked then print("[GamepadTweaks] teleport skipped: battle/dialog\n") return end
+  local tx, ty, tz = tonumber(x), tonumber(y), tonumber(z)   -- panel sends the station point or our refreshed safe point
   pauseUntil = now() + 12
   if ui and ui:IsValid() then pcall(function() ui:GotoDefaultStatus() end) end
-  local cdo = StaticFindObject("/Script/JH.Default__AsyncTaskChangeSceneMap")
-  local task = cdo:ChangeSceneMap(pc, FName(lv), { X = tonumber(x), Y = tonumber(y), Z = tonumber(z) }, 0, true, true, true, true, false)
-  if task and task:IsValid() then task:StartChangeMap() end
-  print("[GamepadTweaks] teleport -> " .. lv .. "\n")
+  changeMap(pc, lv, tx, ty, tz + 30)
+  arrival = { lv = lv, z = tz, at = now(), fallSince = nil, rescued = false }
+  print(string.format("[GamepadTweaks] teleport -> %s (%.0f %.0f %.0f)\n", lv, tx, ty, tz))
+end
+local function playerStart()
+  for _, s in ipairs(FindAllOf("PlayerStart") or {}) do
+    if live(s) then local l = s:K2_GetActorLocation(); return l.X, l.Y, l.Z end
+  end
+  return nil
+end
+local function taskArrival()
+  local a = arrival; if not a then return end
+  local t = now() - a.at
+  if t < 3 then return end
+  if t > 25 or a.rescued then arrival = nil return end
+  local pc = FindFirstOf("BP_PlayerController_C"); if not live(pc) then return end
+  local pawn = pc.Pawn
+  local bad, why = false, ""
+  if not pawn or not pawn:IsValid() then
+    if t > 8 then bad, why = true, "hero missing" end
+  else
+    local full = pawn:GetFullName()
+    if not full:find("." .. a.lv .. ":", 1, true) then return end          -- still loading
+    if not full:find("BP_SceneHero") then return end
+    local l = pawn:K2_GetActorLocation()
+    local m = pawn.CharacterMovement
+    local falling = m and m:IsValid() and m:IsFalling()
+    if falling then a.fallSince = a.fallSince or now() else a.fallSince = nil end
+    if l.Z < a.z - 1500 then bad, why = true, string.format("below target (z %.0f)", l.Z)
+    elseif a.fallSince and now() - a.fallSince > 2.5 then bad, why = true, "falling" end
+  end
+  if not bad then return end
+  local sx, sy, sz = playerStart()
+  a.rescued = true
+  if not sx then print("[GamepadTweaks] arrival rescue: " .. why .. ", but no PlayerStart found\n") return end
+  pauseUntil = now() + 12
+  changeMap(pc, a.lv, sx, sy, sz + 30)
+  visited[a.lv] = nil; saveVisited()          -- the stored point was bad; re-record on the ground
+  print(string.format("[GamepadTweaks] arrival rescue: %s -> PlayerStart %.0f %.0f %.0f\n", why, sx, sy, sz))
 end
 
 -- ---------------------------------------------------------------- 5) maintenance command channel
@@ -414,6 +491,7 @@ local tasks = {
   { every = 3,  fn = taskMapFlag },
   { every = 20, fn = taskVisited },
   { every = 3,  fn = taskTeleport },
+  { every = 3,  fn = taskArrival },
   { every = 10, fn = taskCmd },
   { every = 2,  fn = taskScan },
   { every = 30, fn = taskInteract },

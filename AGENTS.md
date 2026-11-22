@@ -30,7 +30,7 @@ UE4SS ──Lua──> GamepadTweaks/Scripts/main.lua（src/lua）──反射�
 | `battle.flag` | Lua | `1` = 战斗中（DLL 完全放行手柄、隐藏自绘指针） |
 | `ptr.flag` | DLL | `1` = 4 秒内用过右摇杆（Lua 只在此时扫描 UI） |
 | `cur.txt` | Lua | 当前关卡名，如 `LV_25_P` |
-| `visited.txt` | Lua | `关卡|x|y|z`，首次进入时的位置 |
+| `visited.txt` | Lua | `关卡|x|y|z`，该关卡最近一次站在地面上的位置（安全落点） |
 | `places.txt` | 仓库 data/ | `区域\t名称\t关卡,关卡\t驿站关卡\t驿站坐标` |
 | `teleport.req` | DLL | `关卡|x|y|z`，Lua 读取后删除并执行 |
 | `scan_in.txt` / `scan_mid.txt` / `scan_ok.txt` | Lua/DLL | UI 扫描的两阶段交接（见 wsmod.cpp 注释） |
@@ -74,7 +74,8 @@ powershell -File tools\install.ps1
 5. 读 UI 几何不能走 UE4SS 的 Lua（`GetCachedGeometry` 在 Lua 里返回空表），所以由 DLL 直接调 `ProcessEvent`：`PE_RVA = 0x179A420`，启动时会在对象虚表里校验，失败则只关闭吸附功能。**游戏更新后要重新确认这个 RVA**（UE4SS.log 开头有 `ProcessEvent address`，减去模块基址即可）。
 6. UI 可见性要沿父链判断（`shownChain`），按钮自身 `IsVisible()` 为真并不代表在屏幕上（主菜单 1286 个按钮里只有 10 个真的显示）。
 7. `GetListItems()` 返回 Lua table，元素需要 `:get()` 解包；`TArray` 属性用 `:ForEach`。两者不要混用。
-8. 背包隐藏使用 `GRID_ITEM:RemoveItem(spec)`，只影响显示；切换角色时调用 `vm:HandleBackpackBatchChange()` 恢复。
+8. **传送只调用 `ChangeSceneMap`**，它自己会开始加载；再调 `task:StartChangeMap()` 会加载两次并可能把角色放到地图外。到访点只记录角色在地面（`CharacterMovement` 非下坠、Walking/NavWalking）站稳 2 秒后的位置。
+9. 背包隐藏使用 `GRID_ITEM:RemoveItem(spec)`，只影响显示；切换角色时调用 `vm:HandleBackpackBatchChange()` 恢复。
 
 ## 4. 用户偏好（务必保持）
 
@@ -89,7 +90,8 @@ powershell -File tools\install.ps1
 - DATA 目录和游戏路径写死在 `wsmod.cpp`（`DATA_DIR`）和 `main.lua`（`DIR`、`DLLPATH`），换机器要改；可以改成从 DLL 所在目录推导。
 - `ProcessEvent` RVA 按版本写死（见规则 5）。
 - 战斗判定依赖 `BP_FightSpectator_C` 作为 pawn 或战斗技能栏出现，特殊战斗（切磋、擂台、小游戏）未逐一验证。
-- 传送用 `AsyncTaskChangeSceneMap.ChangeSceneMap`，跳过剧情触发可能卡任务；已在战斗、对话、加载时禁止。
+- 传送用 `AsyncTaskChangeSceneMap.ChangeSceneMap`，跳过剧情触发可能卡任务；已在战斗、对话、加载时禁止。落地保护（`taskArrival`）兜底：下坠/掉出地图时送回 PlayerStart。
+- 掉出地图后游戏会销毁角色（日志 `is outside the world bounds`），此时 `pc.Pawn` 为空，用 `ChangeSceneMap` 回到该图的 PlayerStart 可以恢复（2026-11-22 实际救援过一次）。
 - 装备比较只看 `Actions`/`RandActions` 里的 `CAttr(4)` 数值，不考虑特效 buff；属性 ID 与中文属性名的对应关系尚未整理。
 - 切换背包分类标签时被隐藏的装备会闪现约 0.3 秒。
 - 高亮通过给物品格子自带的 `IMG_Focus` 着色实现，原图偏金色，所以内圈仍带一点金色。
