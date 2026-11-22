@@ -65,6 +65,14 @@ powershell -File tools\install.ps1
 6. 测完 `Stop-Process`，并恢复系统指针（`SystemParametersInfo(SPI_SETCURSORS)` + `ClipCursor(NULL)`），因为强杀时 DLL 来不及还原。
 7. 测试前备份 `%LOCALAPPDATA%\Wandering_Sword\Saved\<steamid>\`，测试后确认存档修改时间没变。
 
+### 注入手柄按键做自动测试（不用重启游戏）
+
+`tools/test/`（运行时文件在 `D:\TOOLS\AWSdata\WanderingSword\tools\`）：
+- `wspad.cpp` → `wspadN.dll`：Lua 用 `package.loadlib(dll, "wspad_install")()` 加载，把代理 DLL 里保存的系统 `XInputGetState` 指针换成自己的钩子，按 `pad.req` 脚本（每行 `按键[+按键] 毫秒` 或 `- 毫秒`）叠加按键，完成写 `pad_out.txt`；`wspad_uninstall` 还原。DLL 加载后文件被锁，改了要换文件名编译。
+- 手柄休眠断开后游戏不再读取 XInput：创建 `pad_connect.flag`（让 0 号手柄报告已连接）并给游戏窗口发 `WM_DEVICECHANGE`（0x219, wParam 7）。
+- `hot_reload.ps1`：游戏在前台时发 Ctrl+R 热重载并等日志；`install_reload.ps1`：游戏内语法检查 → 安装 → 关闭人物界面 → 热重载。
+- `nav_verify.ps1`：人物界面切区回归测试（每步读区域 + 截图）。
+
 ## 3. 必须遵守的规则（都是踩过的坑）
 
 1. **Lua 只用一个 `LoopInGameThreadWithDelay` 调度所有任务。** 多个 `LoopAsync` + `ExecuteInGameThread` 会让 UE4SS 4.0 偶发 `Ref was not function` 并崩溃。
@@ -77,6 +85,9 @@ powershell -File tools\install.ps1
 8. **传送只调用 `ChangeSceneMap`**，它自己会开始加载；再调 `task:StartChangeMap()` 会加载两次并可能把角色放到地图外。到访点只记录角色在地面（`CharacterMovement` 非下坠、Walking/NavWalking）站稳 2 秒后的位置。
 9. **调度基准是 20 ms**（`LoopInGameThreadWithDelay(20, …)`，`every` 以拍计）。背包隐藏在 `taskHide` 每拍运行；防闪烁依赖对 `BP_OnEntryInitialized_Event_0` 的 `RegisterHook`，回调里**只改格子透明度，不要改列表**（此时游戏正在遍历列表生成格子）。
 10. 背包隐藏使用 `GRID_ITEM:RemoveItem(spec)`，只影响显示；切换角色时调用 `vm:HandleBackpackBatchChange()` 恢复。
+
+11. **人物界面切区（`taskNav`）**：游戏的 LT/RT 在松开时才移动焦点，所以按下时选目标、松开后再跳，并在 0.3 秒内守住目标；只在手柄模式（`IsGamepadMode()`）下纠正，避免和鼠标悬停抢焦点。跳到背包必须对 `ChangeNaviFocus` 的返回值再 `SetFocus()`。
+12. `inBattle`（= `battle.flag`）在大地图上也为真；只在**真正战斗**时停用的功能用 `inFight`。
 
 ## 4. 用户偏好（务必保持）
 

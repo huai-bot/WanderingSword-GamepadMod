@@ -61,6 +61,17 @@
 - `JHNeoUIItemUtil:BackpackItemCanDoubleClick_WDT(spec, npc)` 不是可用性判定（置灰的拳套也返回 true），不要用。
 - 注意：`CMP_BackpackSortButton` 是另一个（移动端/旧版）整理按钮，电脑版人物界面里不存在。
 
+## 人物界面手柄区域（2026-11-23 注入按键实测）
+
+- 界面 `BPMV_PrimeTeam_C`，5 个手柄区域（`BP_GAARegion_C`，`AreaData.RegionID`）：`Region_SideBar` gr_prime_sidebar（头像）、`Region_Property` gr_prime_team_1（属性）、`Region_Equip` gr_prime_team_2（装备）、`Region_Backpack` gr_prime_team_3（背包）、`Region_BottomBtns` gr_prime_bottombtns（底部按钮）。
+- 子模块 key（`SubModuleMetadatas`）：`SideBar / Property / Equip / Backpack / Formation / MountPet`，对应视图 `BPMV_TeamSideBar2_C / BPMV_Team_Property_C / BPMV_Team_Equip_V3_C / BPMV_PrimeTeamBackpack_C`。
+- 底部按钮从左到右：`BTN_FormatonOut`（上阵）、`CT_BottomBtnsDynamic` 里的 `BTN_QieCuo / BTN_SongLi / BTN_LiDui / BTN_QingJiao`（只对队友显示）、`BTN_MountPet`（坐骑）。
+- 当前所在区域：视图 `HasFocusedDescendants()`；底部按钮看 `HasFocusedDescendants()` 或 `JHGPCBtn_ActiveBG:IsVisible()`。`BP_GAADisplay` 和 `Region_*` 的可见性不能用。
+- 游戏原生：RT 头像→属性→装备→背包（到背包停住），LT 背包→装备→属性（到属性停住）；属性按左→头像，头像按右→属性；属性连按下 5 次→底部按钮；底部按上或 RT→属性，LT 不动。**LT/RT 在松开时才切换**。
+- 程序跳转：`vm = team:GetNeoUIVM()`，`w = vm:ChangeNaviFocus(FName(key), 0, "")` 返回目标控件，**再对它 `:SetFocus()`**（背包必须这样，头像/属性/装备只调 ChangeNaviFocus 也行）。底部按钮：对按钮本身 `:SetFocus()`。`EVT_FocusMountBtn()`、`FocusWidgetForScenario_Direct` 都不移动焦点。
+- 扳机状态：`NeoUISubsystem.InputManager.KeyDownStatus`（map，key 为数字），11 = LT，12 = RT；`InputManager:IsGamepadMode()` 区分手柄/键鼠模式。
+- 大地图（行走地图）上 pawn 是 `BP_WorldHero1_C`，模组的 `battle.flag` 此时也是 1；真正战斗是 `BP_FightSpectator_C` 或战斗技能栏可见。
+
 ## 物品与装备
 
 - `ItemInfoSpec`：`ItemDefId, Num, Actions[], RandActions[], bOnlyForLayout, GainTime, …`，`GetDef()` 返回 `ItemInfoSetting` 行。

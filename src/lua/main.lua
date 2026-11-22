@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.9 loaded\n")
+print("[GamepadTweaks] v4.10 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -44,6 +44,7 @@ end
 
 -- ---------------------------------------------------------------- 1) hide the game's own cursor
 local inBattle = false
+local inFight = false     -- a real fight only (inBattle is also true on the overworld travel map)
 local function taskCursor()
   if inBattle then return end            -- in battle the game manages its own cursor
   local pc = stableWorld(); if pc and pc.bShowMouseCursor then pc.bShowMouseCursor = false end
@@ -272,6 +273,7 @@ local function taskBattle()
   local sigSpell = widgetShown("BPMV_BattleSpell_C")       -- battle skill bar on screen
   local sigPawn = not full:find("BP_SceneHero")            -- controlling something other than the field hero
   local b = sigSpell or sigPawn
+  inFight = sigSpell or full:find("BP_FightSpectator") ~= nil
   if b ~= lastBattle then
     lastBattle = b; inBattle = b
     writeFile("battle.flag", b and "1" or "0")
@@ -576,7 +578,7 @@ local function onOpen(vm)
   return true
 end
 local function taskHide()
-  if inBattle then HIDE.open = false return end
+  if inFight then HIDE.open = false return end
   local vm = HIDE.vm
   if not (vm and vm:IsValid()) then
     if now() < HIDE.findAt then return end
@@ -642,7 +644,7 @@ end
 
 -- ================================================================ sort on open + highlight (slow, 200 ms)
 local function taskBackpack()
-  if inBattle or not stableWorld() then if bp.open then resetEntries(); bp.open = false end return end
+  if inFight or not stableWorld() then if bp.open then resetEntries(); bp.open = false end return end
   local vm = HIDE.vm
   if not (vm and vm:IsValid()) then vm = nil; for _, v in ipairs(FindAllOf("JHMainCharacterBackpackInTeamVM") or {}) do if live(v) then vm = v end end end
   local shown = vm and vm:GetModuleVisibility()
@@ -708,6 +710,121 @@ local function taskBackpack()
   end
 end
 
+-- ---------------------------------------------------------------- 10) character screen: skip 属性 / 装备 for the gamepad
+-- Wanted: LT/RT cycle 头像(SideBar) -> 背包(Backpack) -> 底部按钮(Bottom: 上阵/坐骑/切磋/送礼...) -> 头像, and the
+-- d-pad never parks on 属性(Property) / 装备(Equip).
+-- The game itself (v1.24.32, measured 2026-11-23 with injected input):
+--   RT: SideBar -> Property -> Equip -> Backpack, stops there;  LT: Backpack -> Equip -> Property, stops there
+--   d-pad: Property LEFT -> SideBar, SideBar RIGHT -> Property, Property DOWN x5 -> bottom row, bottom UP / RT -> Property
+-- What we do every tick while the screen is shown (gamepad mode only, so mouse hovering is never fought):
+--   * LT / RT (NeoUIGlobalInputManager.KeyDownStatus: key 11 = LT, 12 = RT): on press pick the next / previous
+--     region of our cycle, on release move there (the game moves on release too) and hold it for 0.3 s
+--   * focus lands on Property / Equip without LT/RT (d-pad): bounce to the region on the far side
+-- Moving focus: SideBar / Backpack = vm:ChangeNaviFocus(FName(key), 0, "") then :SetFocus() on the widget it
+-- returns (Backpack needs the SetFocus); Bottom = :SetFocus() on the first visible bottom button.
+-- Not gated by inBattle: battle.flag is also 1 on the overworld travel map, and the screen cannot open in a fight.
+local NAV = { team = nil, vm = nil, im = nil, findAt = 0, views = nil, open = false, cur = nil, stable = nil,
+  beforeBottom = "SideBar", lt = false, rt = false, want = nil, wantUntil = 0, pending = nil, pendingWhy = nil, tries = 0, lastTry = 0, cfg = true }
+local NAV_VIEWS = { { "SideBar", "BPMV_TeamSideBar2_C" }, { "Property", "BPMV_Team_Property_C" }, { "Equip", "BPMV_Team_Equip_V3_C" }, { "Backpack", "BPMV_PrimeTeamBackpack_C" } }
+local NAV_BTNS = { "BTN_FormatonOut", "BTN_QieCuo", "BTN_SongLi", "BTN_LiDui", "BTN_QingJiao", "BTN_MountPet" }   -- left to right
+local NAV_ORDER = { "SideBar", "Backpack", "Bottom" }
+local NAV_IDX = { SideBar = 1, Backpack = 2, Bottom = 3 }
+local function navRegion()
+  for _, e in ipairs(NAV.views) do
+    local v = e[2]
+    if v:IsValid() and v:IsVisible() and v:HasFocusedDescendants() then return e[1] end
+  end
+  local t = NAV.team
+  for _, bn in ipairs(NAV_BTNS) do
+    local b = t[bn]
+    if b and b:IsValid() and b:IsVisible() then
+      local bg = b.JHGPCBtn_ActiveBG
+      if b:HasFocusedDescendants() or (bg and bg:IsValid() and bg:IsVisible()) then return "Bottom" end
+    end
+  end
+  return nil
+end
+local function navHasBottom()
+  for _, bn in ipairs(NAV_BTNS) do local b = NAV.team[bn]; if b and b:IsValid() and b:IsVisible() then return true end end
+  return false
+end
+local function navFocus(target)
+  if target == "Bottom" then
+    for _, bn in ipairs(NAV_BTNS) do local b = NAV.team[bn]; if b and b:IsValid() and b:IsVisible() then b:SetFocus(); return end end
+    return
+  end
+  local w = NAV.vm:ChangeNaviFocus(FName(target), 0, "")
+  if w and w:IsValid() then w:SetFocus() end
+end
+local function navGo(target, why)
+  NAV.want, NAV.wantUntil, NAV.tries, NAV.lastTry = target, now() + 0.3, 0, 0
+  print(string.format("[GamepadTweaks] nav %s -> %s (%s)\n", tostring(NAV.stable), target, why))
+end
+local function navTriggers()
+  local lt, rt = false, false
+  NAV.im.KeyDownStatus:ForEach(function(k, v) local key = k:get(); if key == 11 then lt = v:get() elseif key == 12 then rt = v:get() end end)
+  return lt, rt
+end
+local function taskNav()
+  local t = NAV.team
+  if not (t and t:IsValid()) then
+    if now() < NAV.findAt then return end
+    NAV.findAt = now() + 1
+    t = nil; for _, v in ipairs(FindAllOf("BPMV_PrimeTeam_C") or {}) do if live(v) then t = v end end
+    NAV.team, NAV.open = t, false
+    if not t then return end
+  end
+  if not t:IsVisible() then NAV.open = false return end
+  if not NAV.open then
+    NAV.open, NAV.cur, NAV.stable, NAV.want, NAV.pending, NAV.beforeBottom = true, nil, nil, nil, nil, "SideBar"
+    NAV.cfg = iniNumber("prime_skip_panels", 1) == 1
+    NAV.vm = t:GetNeoUIVM()
+    NAV.im = nil; for _, s in ipairs(FindAllOf("NeoUISubsystem") or {}) do if live(s) then NAV.im = s.InputManager end end
+    NAV.views = {}
+    for _, p in ipairs(NAV_VIEWS) do
+      for _, v in ipairs(FindAllOf(p[2]) or {}) do if live(v) then NAV.views[#NAV.views + 1] = { p[1], v } end end
+    end
+    NAV.lt, NAV.rt = false, false
+    pcall(function() NAV.lt, NAV.rt = navTriggers() end)
+  end
+  if not NAV.cfg or not (NAV.vm and NAV.vm:IsValid() and NAV.im and NAV.im:IsValid()) then return end
+  local cur = navRegion()
+  local lt, rt = navTriggers()
+  local pressed = 0
+  if rt and not NAV.rt then pressed = 1 elseif lt and not NAV.lt then pressed = -1 end
+  NAV.lt, NAV.rt = lt, rt
+  local pad = true; pcall(function() pad = NAV.im:IsGamepadMode() end)
+  -- the game moves the focus when LT/RT is RELEASED (measured: ~1 press length after the press), so the
+  -- target is chosen on press and applied on release; navGo then holds it for 0.3 s against late moves
+  if pressed ~= 0 and cur and pad then
+    local base = NAV.stable or (NAV_IDX[cur] and cur) or "SideBar"
+    local i = NAV_IDX[base]
+    local target = NAV_ORDER[(i - 1 + pressed) % 3 + 1]
+    if target == "Bottom" and not navHasBottom() then target = NAV_ORDER[(i - 1 + 2 * pressed) % 3 + 1] end
+    NAV.pending, NAV.pendingWhy, NAV.want = target, pressed > 0 and "RT" or "LT", nil
+  end
+  if NAV.pending and not (lt or rt) then navGo(NAV.pending, NAV.pendingWhy); NAV.pending = nil end
+  if not NAV.pending and not NAV.want and not (lt or rt) and pad and (cur == "Property" or cur == "Equip") then
+    local base = NAV.stable or "SideBar"
+    navGo((base == "SideBar") and "Backpack" or (base == "Backpack") and "SideBar" or NAV.beforeBottom, "d-pad into " .. cur)
+  end
+  if NAV.want then
+    if now() > NAV.wantUntil then
+      if cur ~= NAV.want then print(string.format("[GamepadTweaks] nav: gave up on %s (at %s)\n", NAV.want, tostring(cur))) end
+      NAV.want = nil
+    elseif cur ~= NAV.want and NAV.tries < 8 and now() - NAV.lastTry >= 0.035 then
+      NAV.tries, NAV.lastTry = NAV.tries + 1, now()
+      pcall(navFocus, NAV.want)
+      cur = navRegion()
+    end
+  end
+  if cur and NAV_IDX[cur] and not NAV.want and not NAV.pending then
+    if cur == "Bottom" and NAV.stable and NAV.stable ~= "Bottom" then NAV.beforeBottom = NAV.stable end
+    NAV.stable = cur
+  end
+  NAV.cur = cur
+end
+
 -- ---------------------------------------------------------------- scheduler (100 ms tick)
 -- base tick 20 ms (one game-thread loop for everything; "every" is in ticks)
 local tasks = {
@@ -722,6 +839,7 @@ local tasks = {
   { every = 15,  fn = taskBattle },
   { every = 10,  fn = taskBackpack },
   { every = 1,   fn = taskHide },
+  { every = 1,   fn = taskNav },
 }
 local tick = 0
 local errCount = {}
