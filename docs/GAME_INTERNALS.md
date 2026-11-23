@@ -42,7 +42,7 @@
 
 ## 人物界面与背包
 
-- 打开人物界面 = `JHNeoUIPrimeModuleVM:Show()`；界面 `BPMV_Prime_C` → `BPMV_PrimeTeam_C` → `BPMV_PrimeTeamBackpack_C`。
+- 打开人物界面：`JHNeoUIPrimeModuleVM:Show()` 会保留上次的栏目；Start 必须用 `ShowAndGotoTab(1)` 明确打开队伍，关闭用 `Hide()`，用 `CurrentTabIndex()` 校验。栏目编号：1 队伍、2 武功、3 任务、4 经脉。界面 `BPMV_Prime_C` → `BPMV_PrimeTeam_C` → `BPMV_PrimeTeamBackpack_C`。
 - 主角背包 VM：`JHMainCharacterBackpackInTeamVM`（父类 `JHNeoUIItemModuleVM_WDT`）
   - `GetModuleVisibility()` 判断是否打开
   - `GetPairView()` → `BPMV_JHBackpack_Basic_C`
@@ -75,6 +75,17 @@
 - 背包格子：`GRID_ITEM:NavigateToIndex(i)` 把焦点放到第 i 格（`SetSelectedIndex` 不移动焦点），每行 6 格，`GetIndexForItem(spec)` 取当前格序号。
 - 头像栏格子 `BPVE_SideBarCell2_C`（内部按钮 `BTN_SidebarCell`），`:SetFocus()` 可选中指定头像；模块刚拿到焦点后游戏会在约一两帧内再把焦点放回默认头像，需要再设一次。
 - 大地图（行走地图）上 pawn 是 `BP_WorldHero1_C`，模组的 `battle.flag` 此时也是 1；真正战斗是 `BP_FightSpectator_C` 或战斗技能栏可见。
+
+## 战斗速度与自动战斗（2026-11-23 实测）
+
+- 游戏的加速按钮只切换 1/2 倍：改当前持久关卡 `WorldSettings.TimeDilation`（1.0/2.0），`MaxGlobalTimeDilation` 默认 20。界面 `BPMV_JHBattleModule_C`：`BTN_SpeedUp1`（显示 ×1 图标）/`BTN_SpeedUp2`（×2），`HandleBtn_SpeedUp_1()` 由 1 倍切到 2 倍，`HandleBtn_SpeedUp_2()` 由 2 倍切到 1 倍。游戏记住这个开关。
+- 战斗中游戏会反复把 `TimeDilation` 设回自己的值（一场几十次），要每帧重新写。技能特写时战斗界面整个隐藏。
+- 加速事件的原生反射路径：`/Script/JH.JHNeoUIBattleModuleView:HandleBtn_SpeedUp_1` / `HandleBtn_SpeedUp_2`；`BtnSpeedUpFlagIs1()` 返回持久开关（true = 1 倍）。开场或技能特写会刷新图标，不能据此判断用户按键；模组主动调用两个处理函数时必须加重入保护。
+- 自动战斗：`EnableAutoBattle()` / `DisableAutoBattle()` / `BtnAutoBattleFlagIsAuto()`（都在战斗界面上），游戏记住这个开关（跨战斗、跨重启）。
+- 上一场的 `BPMV_JHBattleModule_C` 实例可能还在，要取**可见**的那个。
+- 结算：胜利 `BPMV_BattleWinMaster_C`（VM `JHNeoUIBattleResultVM:HandleModuleClose()` 关闭），失败 `BPMV_BattleFailure_C`（按钮事件 `BndEvt__BPMV_BattleFailure_NeoUIButtonBase_76_..._OnButtonClickedEvent__DelegateSignature`）。
+- `FightManager`：`HandlePawnTurnStart`、`ActionWinLose(Type)`、`TurnManager`。战斗界面还有 `EVT_UpdateSkipButtonVisibility` / `BTN_SkipArena`（擂台跳过，未研究）。
+- 人物界面切磋：`BPMV_PrimeTeam_C` 的 `BndEvt__BPMV_PrimeTeam_BTN_QieCuo_K2Node_ComponentBoundEvent_2_BtnClick__DelegateSignature`（需选中队友）。
 
 ## 观察界面（2026-11-23 实测）
 

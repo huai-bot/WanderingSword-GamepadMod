@@ -50,7 +50,8 @@ powershell -File tools\install.ps1
 ```
 
 - DLL 改完必须重启游戏；Lua 改完可在游戏里按 `Ctrl+R` 热重载（UE4SS 设置里已开 `EnableHotReloadSystem`），但修改调度循环后建议重启。
-- 游戏运行中 `xinput1_3.dll` 被锁定：install.ps1 会先改名旧文件（`xinput1_3.old_*`）再复制，下次启动生效。
+- 必须正常退出游戏后安装；install.ps1 会拒绝向运行中的游戏安装。备份统一放在 `D:\TOOLS\dshdata\dshbackup\WanderingSword-install_<时间>\`，保留 game/data 目录结构；`-Backup` 可复用任务已有备份，不覆盖原始备份。
+- 安装时把 UE4SS `[Debug]` 的 `ConsoleEnabled` / `GuiConsoleEnabled` / `GuiConsoleVisible` 设为 0，只隐藏窗口，文件日志仍保留。
 - 编译后确认新 DLL 里真的包含你的改动（例如搜索新加的日志字符串），曾经出现过两次编辑互相覆盖、编出来的是旧代码。
 
 ### 不打扰用户的自动化测试流程
@@ -64,6 +65,14 @@ powershell -File tools\install.ps1
 5. 截图（不抢焦点）：`powershell -File tools\capture.ps1 -out x.png [-cx -cy -cw -ch 裁剪]`。
 6. 测完 `Stop-Process`，并恢复系统指针（`SystemParametersInfo(SPI_SETCURSORS)` + `ClipCursor(NULL)`），因为强杀时 DLL 来不及还原。
 7. 测试前备份 `%LOCALAPPDATA%\Wandering_Sword\Saved\<steamid>\`，测试后确认存档修改时间没变。
+
+### 不抢前台的测试（用户在用电脑时优先用这些）
+
+- **重载 Lua 不用 Ctrl+R**：在 cmd.lua 里 `ExecuteWithDelay(200, function() RestartCurrentMod() end)`，UE4SS 会卸载并重装本模组（`tools/test/mod_restart.ps1`：游戏内语法检查 → 安装 → 重启模组）。Ctrl+R 只在游戏窗口有焦点时生效。
+- 后台点击：`bg_click.ps1` 用 PostMessage 往游戏窗口发鼠标/键盘消息，不切前台（关胜利结算画面可用；失败画面用它的按钮事件）。
+- 战斗测试：人物界面选中队友 → 调切磋按钮事件 → 用 `HandleBtn_SpeedUp_1/2` 模拟按加速键 → `qb_verify.ps1`（速战全流程）。切磋没有收益，输赢都无影响。
+- 注入手柄（wspad）需要游戏在前台；游戏窗口被别的窗口盖住时游戏不处理手柄输入。
+- PowerShell 变量不区分大小写：脚本里别用 `$w`/`$r` 之类和 `$W`/`$R` 撞名。
 
 ### 注入手柄按键做自动测试（不用重启游戏）
 
@@ -94,9 +103,14 @@ powershell -File tools\install.ps1
 13. **观察界面（`taskObs`）** 与人物界面共用代理的输入掩码（`maskSet(owner, m)` 合并）和同一份 `trig.req` 事件（`taskPadEv` 每拍读一次，`PADEV`）。改其中一边时不要单独调用 `navMask` / `navPadEvents`。`ChangeNaviFocus` 钩子里先交给 `OBS_HOOK`（观察界面可见时屏蔽所有 Property/Equip 请求），再走人物界面的改写。
 14. 不要在 Lua 探测里读控件的 `Slot`、`Font` 等结构（2026-11-23 12:20 读战斗界面这类属性导致 UE4SS 访问冲突崩溃）；只读类反射、名字、可见性、焦点和简单数值。
 
+15. **速战（`taskSpeed`）**：倍率要每拍重写（游戏会改回去），战斗界面隐藏时（技能特写）也要继续维持；自动战斗只在「是模组打开的」（`quick_auto.flag`）时才替用户关掉。Lua 里别写 `a and f() or nil` 取布尔返回值（false 会变 nil，v4.15 初版因此在 1 倍时不工作）。
+16. 加速循环由 `/Script/JH.JHNeoUIBattleModuleView:HandleBtn_SpeedUp_1/2` 的钩子累计按键，不能根据图标刷新猜输入。`SPD.correcting` 屏蔽自己修正图标产生的事件；开场按键应保留到战斗界面就绪。
+17. `wsmod_mute_0/1` 只控制当前游戏进程的 Windows 音频会话，COM 操作在独立线程；保留原静音状态、不改音量。静音与遮罩独立，500 ms 没收到 Lua 更新就恢复；不要在 DllMain 里调用 COM。
+
 ## 4. 用户偏好（务必保持）
 
 - 交流用中文。
+- 用户在用电脑时，测试尽量在后台进行（不抢焦点、不注入手柄）；必须前台时先告诉用户。
 - **鼠标优先**：用过右摇杆后 A 是鼠标左键，原生 A 逻辑让位；只有按十字键或推左摇杆才恢复原生 A。
 - 战斗中右摇杆不能有鼠标效果，所有按键用游戏原生手柄逻辑。
 - 一次把需求做完再汇报，不要做一点停一点让用户测试；能自己验证的自己验证（读日志、测试实例、截图）。

@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.14 loaded\n")
+print("[GamepadTweaks] v4.21 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -50,8 +50,124 @@ local function taskCursor()
   local pc = stableWorld(); if pc and pc.bShowMouseCursor then pc.bShowMouseCursor = false end
 end
 
+-- ---------------------------------------------------------------- 1b) Start -> character screen, gamepad mode kept
+-- The proxy used to open AND close the character screen by tapping keyboard B. Any keyboard event switches the
+-- game to keyboard/mouse mode (log: "键鼠模式 : --- show cursor"), which hides the gamepad focus frame until the
+-- stick is moved. Closing with B left the game in keyboard mode for the next opening too.
+-- Now the proxy writes start.req and waits up to 0.6 s for start.ack:
+--   "1" = done here without any input event: JHNeoUIPrimeModuleVM:ShowAndGotoTab(1) / :Hide() (the game stays
+--         in its input mode; every opening selects 队伍 instead of remembering 任务 / 武功 / 经脉)
+--   "0" = not possible here (fight, dialog, no HUD = cut-scene / loading, ...): the proxy taps B as before.
+-- v4.17 "clicked" the HUD's 人物 button instead: that event does not open the screen (measured 2026-11-24).
+local START = { pending = nil, at = 0 }
+os.remove(DIR .. "start.req"); os.remove(DIR .. "start.take")
+local function primeVM()
+  for _, v in ipairs(FindAllOf("JHNeoUIPrimeModuleVM") or {}) do if live(v) then return v end end
+  return nil
+end
+local function primeShown(v)
+  v = v or primeVM(); if not v then return false end
+  local ok, vis = pcall(function() return v:GetModuleVisibility() end)
+  return ok and vis or false
+end
+-- the field's own gamepad menu (e.g. the NPC pop-up menu 交谈/观察/切磋... next to an NPC). v4.18 opened the
+-- character screen over it with :Show(); that menu stayed JHGamepadMainInputManager.CurGameMenu and kept taking
+-- A / d-pad under the character screen (stray 观察 etc., 2026-11-24). The game's own B path handles it, so then
+-- we leave it to B.
+local function fieldMenu()
+  for _, o in ipairs(FindAllOf("JHGamepadMainInputManager") or {}) do
+    if live(o) then
+      local ok, name = pcall(function() local m = o.CurGameMenu; if m and m:IsValid() then return m:GetClass():GetFName():ToString() end return nil end)
+      if ok and name then return name end
+    end
+  end
+  return nil
+end
+local function hudFree()
+  -- free roaming: the HUD's own 人物 button is on screen, no field menu is active and the UI does not block input
+  local gm = fieldMenu()
+  if gm then return false, "field menu " .. gm .. " active" end
+  local btn = false
+  for _, b in ipairs(FindAllOf("BPVE_HUD_NaviBtn_C") or {}) do
+    if live(b) and b:GetFName():ToString() == "Btn_Prime" then local ok, vis = pcall(function() return b:IsVisible() end); if ok and vis then btn = true end end
+  end
+  if not btn then return false, "no HUD" end
+  local ui = getUI()
+  if ui then
+    local blocked = false
+    pcall(function() if ui:ShouldDisableInput() then blocked = true end end)
+    pcall(function() local d = ui:GetDialogView(); if d and d:IsValid() and d:IsVisible() then blocked = true end end)
+    if blocked then return false, "UI busy" end
+  end
+  return true
+end
+local PRIMEWATCH = { vis = false, ours = false, menu = nil }
+local function primeWatch()
+  local W_ = PRIMEWATCH
+  local vis = primeShown()
+  if vis and not W_.vis then
+    W_.ours = START.openedAt ~= nil and now() - START.openedAt < 1.0
+    W_.menu = fieldMenu()
+    local pad = "?"                                        -- (NAV is declared further down: not visible here)
+    pcall(function() for _, x in ipairs(FindAllOf("NeoUISubsystem") or {}) do if live(x) then pad = tostring(x.InputManager:IsGamepadMode()) end end end)
+    print(string.format("[GamepadTweaks] Start: screen shown by %s, field menu %s, gamepad mode %s\n", W_.ours and "mod" or "game", tostring(W_.menu), pad))
+  elseif vis then
+    local gm = fieldMenu()
+    if gm ~= W_.menu then
+      print(string.format("[GamepadTweaks] Start: field menu under the character screen %s -> %s (screen opened by %s)\n", tostring(W_.menu), tostring(gm), W_.ours and "mod" or "game"))
+      W_.menu = gm
+    end
+  end
+  W_.vis = vis
+end
+local function taskStart()
+  if (START.tick or 0) % 5 == 0 then pcall(primeWatch) end
+  START.tick = (START.tick or 0) + 1
+  local P = START
+  if not P.pending then
+    if not os.rename(DIR .. "start.req", DIR .. "start.take") then return end
+    os.remove(DIR .. "start.take")
+    if inFight or not stableWorld() then writeFile("start.ack", "0") return end
+    local vm = primeVM()
+    if not vm then writeFile("start.ack", "0") return end
+    if primeShown(vm) then
+      local ok = pcall(function() vm:Hide() end)
+      if not ok then writeFile("start.ack", "0") return end
+      P.pending, P.at, P.vm = "close", now(), vm
+    else
+      local free, why = hudFree()
+      if not free then writeFile("start.ack", "0") print("[GamepadTweaks] Start: " .. why .. ", proxy taps B\n") return end
+      local ok, accepted = pcall(function() return vm:ShowAndGotoTab(1) end)
+      if not ok or not accepted then writeFile("start.ack", "0") return end
+      P.pending, P.at, P.vm = "open", now(), vm
+    end
+  end
+  local shown = primeShown(P.vm)
+  local done = (P.pending == "open") == shown
+  if done and P.pending == "open" then
+    local ok, tab = pcall(function() return P.vm:CurrentTabIndex() end)
+    done = ok and tab == 1
+  end
+  if done then
+    if P.pending == "open" then P.openedAt = now() end
+    print(string.format("[GamepadTweaks] Start: character screen %s in %.0f ms (no key event)\n", P.pending == "open" and "opened" or "closed", (now() - P.at) * 1000))
+    P.pending = nil; writeFile("start.ack", "1")
+  elseif now() - P.at > 0.35 then
+    print("[GamepadTweaks] Start: " .. P.pending .. " did not take effect, proxy taps B\n")
+    P.pending = nil; writeFile("start.ack", "0")
+  end
+end
+
 -- ---------------------------------------------------------------- 2) world map open flag
 local lastMap = nil
+local battleFlag = nil
+local lastBattle = nil
+local fightFlag = nil
+local function writeBattleFlag()
+  local f = inFight or (lastBattle == true and lastMap ~= "1")
+  if f ~= battleFlag then battleFlag = f; writeFile("battle.flag", f and "1" or "0") end
+  if inFight ~= fightFlag then fightFlag = inFight; writeFile("fight.flag", inFight and "1" or "0") end   -- proxy: Start native only here
+end
 local function taskMapFlag()
   local open = false
   if now() >= pauseUntil then
@@ -59,7 +175,7 @@ local function taskMapFlag()
     if w and w:IsValid() and w:IsVisible() then open = true end
   end
   local v = open and "1" or "0"
-  if v ~= lastMap then lastMap = v; writeFile("map.flag", v) end
+  if v ~= lastMap then lastMap = v; writeFile("map.flag", v); writeBattleFlag() end
 end
 
 -- ---------------------------------------------------------------- 3) visited levels -> safe landing points
@@ -123,9 +239,10 @@ local function taskTeleport()
   local lv, x, y, z = line:match("^([%w_]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)")
   if not lv then return end
   local pc, pawn, cur, full = stableWorld(); if not pc then print("[GamepadTweaks] teleport skipped: world not stable\n") return end
-  if not full:find("BP_SceneHero") then print("[GamepadTweaks] teleport skipped: not in scene\n") return end
+  -- any field pawn may teleport (scene hero, overworld hero BP_WorldHero1_C); never from a fight
+  if inFight or full:find("BP_FightSpectator") then print("[GamepadTweaks] teleport skipped: in a fight\n") return end
   local ui = getUI()
-  local blocked = inBattle
+  local blocked = inFight
   if ui then
     pcall(function() if ui:ShouldDisableInput() then blocked = true end end)
     pcall(function() local d = ui:GetDialogView(); if d and d:IsValid() and d:IsVisible() then blocked = true end end)
@@ -266,7 +383,6 @@ local function widgetShown(cls)
   end
   return false
 end
-local lastBattle = nil
 local function taskBattle()
   local pc, pawn, lv, full = stableWorld()
   if not pc then return end
@@ -274,9 +390,9 @@ local function taskBattle()
   local sigPawn = not full:find("BP_SceneHero")            -- controlling something other than the field hero
   local b = sigSpell or sigPawn
   inFight = sigSpell or full:find("BP_FightSpectator") ~= nil
+  writeBattleFlag()
   if b ~= lastBattle then
-    lastBattle = b; inBattle = b
-    writeFile("battle.flag", b and "1" or "0")
+    lastBattle = b; inBattle = b; writeBattleFlag()
     print(string.format("[GamepadTweaks] battle=%s (spellbar=%s pawn=%s %s)\n", tostring(b), tostring(sigSpell), tostring(sigPawn), full:match("[^%.]+$") or "?"))
   end
 end
@@ -1140,29 +1256,91 @@ local function taskObs()
 end
 local function taskPadEv() PADEV = navPadEvents() end
 
--- ---------------------------------------------------------------- 11) battle speed x1 -> x2 -> x3 -> x4 -> x1
+-- ---------------------------------------------------------------- 11) battle speed: x1 -> x2 -> 速战 -> x1
 -- The game's speed button only toggles x1 / x2: it sets the persistent level's WorldSettings.TimeDilation to
 -- 1.0 / 2.0 (measured 2026-11-23; nothing else changes) and shows BTN_SpeedUp1 (x1 icon) or BTN_SpeedUp2 (x2).
--- Each press flips the game's own on/off state; we count the flips: 1 -> 2 -> 3 -> 4 -> 1 (with speed_max = 4
--- the game is off at x1/x3 and on at x2/x4). Whenever our level differs from what the game would use, we keep
--- TimeDilation at the level every tick (anything the game re-applies is overwritten next tick) and show a badge.
--- The press is detected from the icon flip, so mouse, keyboard and gamepad all work. The level is kept for
--- the next fight. [battle] speed_max = 2..4 (2 = the game's own behaviour). x3/x4 badge: wsmod_speed_<n>.
--- Reads only widget visibility and one float; no struct/slot reads (those crashed UE4SS, 2026-11-23 12:20).
-local SPD = { view = nil, ws = nil, findAt = 0, active = false, on = nil, level = 1, mem = 1, written = nil, max = 4,
-  overwrites = 0, exports = nil }
+-- 速战 (quick battle): the game's own auto battle (view:EnableAutoBattle) + TimeDilation held at quick_speed
+-- (default 50; MaxGlobalTimeDilation raised for it). The fight is still played out by the game - win or lose -,
+-- only compressed: 1v1 sparring took 6-10 s at x2 and 0.6-2.3 s at x20/x50/x100 (9 fights, no stalls).
+-- Cycle by hooks on the actual speed-button handlers (mouse / keyboard / gamepad), not icon changes:
+-- x1 -> x2 -> 速战 -> x1. The game restores its icon during fight startup and cut-ins; that is not a press.
+-- Our own icon corrections are guarded so they cannot advance the cycle. Early presses are queued until the
+-- battle view is ready. Auto battle is switched off again only if we switched it on. The level is kept for
+-- the next fight. Watchdog: 速战 longer than quick_timeout s falls back to x2, keeping auto battle on.
+-- quick_mask = 1 covers the flickering battle; quick_mute = 1 temporarily mutes only this game's audio session.
+-- Both native effects have a 500 ms heartbeat: a Lua restart or stopped loop releases them automatically.
+-- Reads only widget visibility and simple values; no struct/slot reads (those crashed UE4SS, 2026-11-23 12:20).
+local SPD_Q = 3
+local SPD = { view = nil, ws = nil, findAt = 0, active = false, on = nil, level = 1, mem = 1, written = nil,
+  overwrites = 0, exports = nil, quick = true, qspeed = 50, qtimeout = 90, qStart = nil, qClock = nil, autoByUs = false, mask = true,
+  mute = true, correcting = false, presses = 0, hooks = {}, hookAt = 0, maxOrig = nil, over = false, resAt = 0 }
+do                                                                     -- level kept across mod / game restarts
+  local m = tonumber((readFirst("speed_level.txt") or ""):match("%d") or "")
+  if m and m >= 1 and m <= 3 then SPD.mem = m end
+end
+local function spdRemember(l) if l ~= SPD.mem then SPD.mem = l; writeFile("speed_level.txt", tostring(l)) end end
 do
   local e = {}
-  for n = 0, 4 do e[n] = package.loadlib(DLLPATH, "wsmod_speed_" .. n) end
-  if e[0] and e[4] then SPD.exports = e end
+  for n = 0, 6 do e[n] = package.loadlib(DLLPATH, "wsmod_speed_" .. n) end
+  if e[0] then SPD.exports = e end
+  SPD.muteOff = package.loadlib(DLLPATH, "wsmod_mute_0")
+  SPD.muteOn = package.loadlib(DLLPATH, "wsmod_mute_1")
 end
-local function spdBadge(n) if SPD.exports then SPD.exports[n]() end end
+local function spdBadge(n) if SPD.exports and SPD.exports[n] then SPD.exports[n]() end end
+local function spdMute(on)
+  if on then if SPD.muteOn then SPD.muteOn() end
+  elseif SPD.muteOff then SPD.muteOff() end
+end
 local function spdGameOn(v)
+  local ok, is1 = pcall(function() return v:BtnSpeedUpFlagIs1() end)
+  if ok and type(is1) == "boolean" then return not is1 end
   local b1, b2 = v.BTN_SpeedUp1, v.BTN_SpeedUp2
   if not (b1 and b1:IsValid() and b2 and b2:IsValid()) then return nil end
   local v1, v2 = b1:IsVisible(), b2:IsVisible()
   if v1 == v2 then return nil end
   return v2
+end
+local function spdSetGame(v, on)
+  if spdGameOn(v) == on then return end
+  SPD.correcting = true
+  local ok, err = pcall(function() if on then v:HandleBtn_SpeedUp_1() else v:HandleBtn_SpeedUp_2() end end)
+  SPD.correcting = false
+  if not ok then error(err) end
+  SPD.on = spdGameOn(v)
+end
+local function spdFightPawn()
+  local pc = FindFirstOf("BP_PlayerController_C"); if not live(pc) then return false end
+  local pawn = pc.Pawn; if not live(pawn) then return false end
+  return pawn:GetFullName():find("BP_FightSpectator") ~= nil
+end
+local function spdInstallHooks()
+  if SPD.hooks[1] and SPD.hooks[2] then return end
+  if now() < SPD.hookAt then return end
+  SPD.hookAt = now() + 1
+  for n = 1, 2 do
+    if not SPD.hooks[n] then
+      local path = "/Script/JH.JHNeoUIBattleModuleView:HandleBtn_SpeedUp_" .. n
+      local fn = StaticFindObject(path)
+      if fn and fn:IsValid() then
+        local ok, err = pcall(function()
+          RegisterHook(path, function(self)
+            if SPD.correcting or SPD.over then return end
+            local good, e = pcall(function()
+              local v = self:get()
+              if not live(v) or not spdFightPawn() then return end
+              local a = v:GetAddress()
+              if SPD.pressView ~= a then SPD.pressView, SPD.presses = a, 0 end
+              SPD.presses = SPD.presses + 1
+            end)
+            if not good then print("[GamepadTweaks] speed: button hook error: " .. tostring(e) .. "\n") end
+          end)
+        end)
+        SPD.hooks[n] = ok
+        if ok then print("[GamepadTweaks] speed: button " .. n .. " hook registered\n")
+        elseif not SPD.hookError then SPD.hookError = true; print("[GamepadTweaks] speed: hook unavailable: " .. tostring(err) .. "\n") end
+      end
+    end
+  end
 end
 local function spdFindWS()
   local pc = FindFirstOf("BP_PlayerController_C"); if not live(pc) then return nil end
@@ -1175,57 +1353,173 @@ local function spdFindWS()
   end
   return nil
 end
+-- the game keeps the auto-battle switch between fights (and across restarts), so "we switched it on" is kept in
+-- quick_auto.flag: the next fight that is not 速战 switches it off again
+SPD.autoByUs = readFirst("quick_auto.flag") ~= nil
+local function spdAutoMark(on)
+  if on == SPD.autoByUs then return end
+  SPD.autoByUs = on
+  if on then writeFile("quick_auto.flag", "1") else os.remove(DIR .. "quick_auto.flag") end
+end
+local function spdAuto(v, on)
+  local ok, isAuto = pcall(function() return v:BtnAutoBattleFlagIsAuto() end)
+  if not ok then return end
+  if on and not isAuto then
+    local done = pcall(function() v:EnableAutoBattle() end); if done then spdAutoMark(true) end
+  elseif not on and isAuto and SPD.autoByUs then
+    local done = pcall(function() v:DisableAutoBattle() end); if done then spdAutoMark(false) end
+  elseif not on then spdAutoMark(false) end
+end
+local function spdName(l) return l == SPD_Q and "速战" or ("x" .. l) end
 local function spdEnd()
+  spdMute(false)
   if SPD.active then
+    if SPD.view and SPD.view:IsValid() then spdAuto(SPD.view, false) end
     local ws = SPD.ws
-    if SPD.written and ws and ws:IsValid() and math.abs(ws.TimeDilation - SPD.written) < 0.01 then ws.TimeDilation = 1.0 end
-    print(string.format("[GamepadTweaks] speed: fight over at x%d (game re-applied %d times)\n", SPD.level, SPD.overwrites))
+    if ws and ws:IsValid() then
+      if SPD.written and math.abs(ws.TimeDilation - SPD.written) < 0.01 then ws.TimeDilation = 1.0 end
+      if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig end
+    end
+    local dur = SPD.qStart and (os.time() - SPD.qStart) or nil
+    print(string.format("[GamepadTweaks] speed: fight over at %s%s (game re-applied %d times)\n", spdName(SPD.level),
+      dur and string.format(", 速战 %d s", dur) or "", SPD.overwrites))
   end
-  SPD.active, SPD.view, SPD.ws, SPD.on, SPD.written = false, nil, nil, nil, nil
+  SPD.active, SPD.view, SPD.ws, SPD.on, SPD.written, SPD.qStart, SPD.maxOrig = false, nil, nil, nil, nil, nil, nil
+  SPD.over, SPD.qClock, SPD.seen, SPD.pressView, SPD.presses = false, nil, nil, nil, 0
+  SPD.findAt = 0
   spdBadge(0)
 end
+-- result screen up: the fight is decided, stop holding the speed (the screen's own animations run normally)
+local function spdResult()
+  for _, cn in ipairs({ "BPMV_BattleWinMaster_C", "BPMV_BattleFailure_C" }) do
+    for _, o in ipairs(FindAllOf(cn) or {}) do if live(o) and o:IsVisible() then return cn end end
+  end
+  return nil
+end
 local function taskSpeed()
-  if not inFight then if SPD.active or SPD.view then spdEnd() end return end
+  spdInstallHooks()
+  -- taskBattle runs every 300 ms. A real button press can arrive before that poll sees the new fight.
+  if not inFight then
+    if SPD.presses > 0 and spdFightPawn() then inFight = true
+    else if SPD.active or SPD.view or SPD.presses > 0 then spdEnd() end return end
+  end
+  if SPD.over then return end
+  -- the battle HUD is hidden during skill cut-ins: keep the view once found and keep holding the speed meanwhile
+  -- (v4.15 first build dropped the view while hidden, so the game ran those cut-ins at x1)
+  -- several BPMV_JHBattleModule_C instances can exist (the last fight's one lingers): switch to a visible one
+  -- whenever ours is hidden, keep ours only while none is visible (cut-in)
   local v = SPD.view
   if not (v and v:IsValid() and v:IsVisible()) then
-    SPD.view = nil
-    if now() < SPD.findAt then return end
-    SPD.findAt = now() + 0.5
-    for _, x in ipairs(FindAllOf("BPMV_JHBattleModule_C") or {}) do if live(x) and x:IsVisible() then SPD.view = x end end
-    v = SPD.view
+    if now() >= SPD.findAt or not (v and v:IsValid()) then
+      SPD.findAt = now() + 0.25
+      local vis = nil
+      for _, x in ipairs(FindAllOf("BPMV_JHBattleModule_C") or {}) do if live(x) and x:IsVisible() then vis = x end end
+      if vis then SPD.view = vis elseif not (v and v:IsValid()) then SPD.view = nil end
+      v = SPD.view
+    end
     if not v then return end
   end
   local ws = SPD.ws
   if not (ws and ws:IsValid()) then ws = spdFindWS(); SPD.ws = ws; if not ws then return end end
-  local on = spdGameOn(v); if on == nil then return end
-  if not SPD.active then
-    SPD.active, SPD.on, SPD.overwrites = true, on, 0
-    SPD.max = iniNumber("speed_max", 4); if SPD.max < 2 then SPD.max = 2 elseif SPD.max > 4 then SPD.max = 4 end
-    -- keep the level from the last fight when it fits the game's state, else take the game's
-    local m = SPD.mem
-    if m > SPD.max then m = SPD.max end
-    if ((m % 2 == 0) == on) then SPD.level = m else SPD.level = on and 2 or 1 end
-    print(string.format("[GamepadTweaks] speed: fight start, game %s, level x%d\n", on and "x2" or "x1", SPD.level))
-  elseif on ~= SPD.on then
-    SPD.on = on
-    local nxt = SPD.level % SPD.max + 1                                -- 1 -> 2 -> ... -> max -> 1
-    SPD.level = nxt; SPD.mem = nxt
-    print(string.format("[GamepadTweaks] speed: button -> x%d\n", nxt))
-  end
-  local want, gameVal = SPD.level, on and 2 or 1
-  if want ~= gameVal then                                               -- x3 / x4 (or x1 while the game shows x2 with speed_max = 3)
-    if math.abs(ws.TimeDilation - want) > 0.01 then
-      if SPD.written then SPD.overwrites = SPD.overwrites + 1 end
-      ws.TimeDilation = want; SPD.written = want
+  if SPD.active and now() - SPD.resAt > 0.1 then
+    SPD.resAt = now()
+    local r = spdResult()
+    if r then
+      SPD.over, SPD.presses = true, 0
+      spdMute(false)
+      spdAuto(v, false)
+      ws.TimeDilation = 1.0
+      if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig; SPD.maxOrig = nil end
+      SPD.written = nil
+      if SPD.qClock then print(string.format("[GamepadTweaks] speed: 速战 decided in %.1f s (%s, game re-applied %d times)\n", os.clock() - SPD.qClock, r:gsub("BPMV_", ""):gsub("_C$", ""), SPD.overwrites)) end
+      spdBadge(0)
+      return
     end
-    spdBadge(want)
-  else
-    SPD.written = nil                                                   -- the game's own value and icon are right
-    spdBadge(0)
   end
+  local hudUp = v:IsVisible()
+  local on = spdGameOn(v)                                           -- the game's flag also works during cut-ins
+  if on == nil then on = SPD.on end
+  if on == nil then
+    if not SPD.active and now() - (SPD.dbgAt or 0) > 2 then
+      SPD.dbgAt = now()
+      local b1, b2 = "?", "?"
+      pcall(function() b1 = tostring(v.BTN_SpeedUp1:IsVisible()); b2 = tostring(v.BTN_SpeedUp2:IsVisible()) end)
+      print(string.format("[GamepadTweaks] speed: waiting for the speed icons (hud %s, x1 %s, x2 %s)\n", tostring(hudUp), b1, b2))
+    end
+    return
+  end
+  if not SPD.active then
+    if not hudUp then return end
+    SPD.seen = SPD.seen or now()
+    if SPD.presses == 0 and now() - SPD.seen < 0.3 then return end    -- pending presses never get discarded
+    SPD.active, SPD.on, SPD.overwrites = true, on, 0
+    SPD.quick = iniNumber("quick_battle", 1) == 1
+    SPD.qspeed = iniNumber("quick_speed", 50); if SPD.qspeed < 3 then SPD.qspeed = 3 elseif SPD.qspeed > 200 then SPD.qspeed = 200 end
+    SPD.qtimeout = iniNumber("quick_timeout", 90)
+    SPD.mask = iniNumber("quick_mask", 1) == 1 and SPD.exports ~= nil and SPD.exports[6] ~= nil
+    SPD.mute = iniNumber("quick_mute", 1) == 1
+    local m = SPD.mem
+    if m == SPD_Q and not SPD.quick then m = 1 end
+    -- 速战 is kept whatever the game's own switch says (v4.15-4.19 dropped it when the game started at x2, e.g.
+    -- after a fight left at x2: "fight start, game x2, level x2"); x1 / x2 follow the game's switch
+    if m == SPD_Q or SPD.presses > 0 then SPD.level = m
+    else SPD.level = on and 2 or 1 end
+    if SPD.level ~= SPD_Q and SPD.autoByUs then spdAuto(v, false) end
+    print(string.format("[GamepadTweaks] speed: fight start, game %s, level %s\n", on and "x2" or "x1", spdName(SPD.level)))
+  end
+  local presses = SPD.presses
+  SPD.presses = 0
+  if SPD.pressView and SPD.pressView ~= v:GetAddress() then presses = 0 end
+  for _ = 1, presses do
+    local nxt
+    if SPD.level == 1 then nxt = 2
+    elseif SPD.level == 2 then nxt = SPD.quick and SPD_Q or 1
+    else nxt = 1 end
+    SPD.level = nxt; spdRemember(nxt)
+    print(string.format("[GamepadTweaks] speed: button -> %s\n", spdName(nxt)))
+  end
+  -- Icon refreshes are not user input. Keep the game's persistent flag in sync with our chosen level.
+  -- 速战 uses the game's x1 flag; its actual TimeDilation is held separately below.
+  local lvl = SPD.level
+  spdSetGame(v, lvl == 2)
+  SPD.on = spdGameOn(v)
+  local timedOut = false
+  if lvl == SPD_Q then
+    spdMute(SPD.mute)                                                 -- independent of the visual mask
+    if not SPD.qStart then
+      SPD.qStart, SPD.qClock = os.time(), os.clock()
+      SPD.maxOrig = SPD.maxOrig or ws.MaxGlobalTimeDilation
+    elseif os.clock() - SPD.qClock >= SPD.qtimeout then
+      print(string.format("[GamepadTweaks] speed: 速战 still running after %.1f s, falling back to x2\n", os.clock() - SPD.qClock))
+      SPD.level, lvl, timedOut = 2, 2, true
+      spdRemember(2)
+      spdSetGame(v, true)
+    end
+    if lvl == SPD_Q then
+      if ws.MaxGlobalTimeDilation < SPD.qspeed then ws.MaxGlobalTimeDilation = SPD.qspeed end
+      spdAuto(v, true)                                                -- retry if the game reset auto during startup
+    end
+  end
+  if lvl ~= SPD_Q then
+    spdMute(false)
+    if SPD.qStart then
+      SPD.qStart, SPD.qClock = nil, nil
+      if not timedOut then spdAuto(v, false) end                      -- watchdog keeps auto on to finish normally
+      if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig; SPD.maxOrig = nil end
+    end
+  end
+  local want = (lvl == SPD_Q) and SPD.qspeed or lvl
+  if math.abs(ws.TimeDilation - want) > 0.01 then
+    if SPD.written then SPD.overwrites = SPD.overwrites + 1 end
+    ws.TimeDilation = want
+  end
+  SPD.written = want
+  if lvl == SPD_Q and SPD.mask then spdBadge(6)                        -- maintained even during cut-ins
+  elseif lvl == SPD_Q and hudUp then spdBadge(5)
+  else spdBadge(0) end
 end
 
--- ---------------------------------------------------------------- scheduler (100 ms tick)
+-- ---------------------------------------------------------------- scheduler (20 ms tick)
 -- base tick 20 ms (one game-thread loop for everything; "every" is in ticks)
 local tasks = {
   { every = 25,  fn = taskCursor },
@@ -1240,6 +1534,7 @@ local tasks = {
   { every = 10,  fn = taskBackpack },
   { every = 1,   fn = taskHide },
   { every = 1,   fn = taskPadEv },
+  { every = 1,   fn = taskStart },
   { every = 1,   fn = taskNav },
   { every = 1,   fn = taskObs },
   { every = 1,   fn = taskSpeed },
@@ -1248,6 +1543,7 @@ local tick = 0
 local errCount = {}
 writeFile("map.flag", "0")
 writeFile("battle.flag", "0")
+writeFile("fight.flag", "0")
 writeFile("prime.flag", "0"); os.remove(DIR .. "trig.req")
 LoopInGameThreadWithDelay(20, function()
   tick = tick + 1

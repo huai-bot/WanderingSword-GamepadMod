@@ -24,7 +24,7 @@
 - 战斗中自动停用以上全部功能，手柄完全交还游戏
 
 **按键**
-- Start 打开人物界面（原为系统菜单）
+- Start 固定打开人物界面的「队伍」栏目，再按关闭；不再沿用上次的任务、武功或经脉栏目（原为系统菜单）
 - 交互判定半径从 35 扩大到 90（可配置）
 
 **世界地图**
@@ -38,7 +38,8 @@
 - 「全部」分类里不显示已学成（含游戏标「学成」）的秘籍/图纸、任务道具、烹饪/锻造/缝制材料和珍宝（书画、棋具、茶具、古籍、琴、花等），只在各自分类里显示；切换角色或分类时不闪烁
 - 人物界面手柄跳过「属性」「装备」两栏：LT/RT 在头像、背包、底部按钮（上阵/坐骑/切磋/送礼）之间循环，十字键/左摇杆也不会停在这两栏，切换无闪烁；切回时回到原来的头像和背包格子
 - 观察界面同样跳过「属性」「装备」：打开时焦点在切磋，LT/RT 在背包和底部按钮间切换，按上从底部按钮进入背包
-- 战斗加速 1→2→3→4 倍循环（`speed_max` 可设上限）
+- 战斗加速按钮 1 倍 → 2 倍 → 速战 → 1 倍循环：速战 = 游戏自带自动战斗 + 50 倍速，胜负照常由游戏判定；直接识别加速按钮操作，开场按键不会被忽略
+- 速战期间默认遮住闪烁画面并临时静音**本游戏**，不影响其他应用；退出速战、结算或超时回退后恢复原来的静音状态，不改游戏音量设置
 - 属性高于该角色同部位已穿装备的物品显示高亮框（默认蓝紫色，颜色可配置）
 
 ## 安装
@@ -46,8 +47,8 @@
 1. 安装 UE4SS v4.0.0 到 `<游戏>\Wandering_Sword\Binaries\Win64\`（`dwmapi.dll` + `ue4ss\`）
 2. 编译原生部分：`tools\build.bat`（生成 `build\xinput1_3.dll`）
 3. 首次需要提取游戏指针图标：`powershell -File tools\extract_cursor.ps1`（游戏资源不随仓库分发）
-4. 安装：`powershell -File tools\install.ps1`（会先备份被替换的文件）
-5. 启动游戏。UE4SS 控制台出现 `[GamepadTweaks] v4.x loaded`，`D:\TOOLS\AWSdata\WanderingSword\wsmod.log` 出现 `wsmod loaded` 即成功
+4. 正常退出游戏后安装：`powershell -File tools\install.ps1`（备份放在 `D:\TOOLS\dshdata\dshbackup\WanderingSword-install_<时间>\`，保留目录结构；可用 `-Backup` 指定已有备份目录）
+5. 启动游戏。安装时默认关闭两个 UE4SS 日志窗口，但仍写日志：[UE4SS.log](<D:/GAME/Wandering Sword/Wandering_Sword/Binaries/Win64/ue4ss/UE4SS.log>) 中出现 `[GamepadTweaks] v4.x loaded`，[wsmod.log](<D:/TOOLS/AWSdata/WanderingSword/wsmod.log>) 中出现 `wsmod loaded` 即成功
 
 卸载：删除 `Win64\xinput1_3.dll`，并在 `ue4ss\Mods\mods.txt` 里把 `GamepadTweaks` 改为 `0`。
 
@@ -70,7 +71,11 @@
 | | `tidy_all_tab` | 「全部」里隐藏已学成秘籍/图纸、任务道具、材料、珍宝 | 下次打开人物界面 |
 | | `cell_hook` | 切换时防闪烁（生成格子时即隐藏） | 重启游戏 |
 | | `prime_skip_panels` | 人物界面手柄跳过「属性」「装备」，LT/RT 在 头像→背包→底部按钮 间循环 | 下次打开人物界面 |
-| | `speed_max` | 战斗加速按钮的最高倍率 2~4（2 = 原版） | 下一场战斗 |
+| | `quick_battle` | 加速按钮循环里加入速战（0 = 只有原版 1/2 倍） | 下一场战斗 |
+| | `quick_speed` | 速战倍率 3~200（实测 20/50/100 都稳定） | 下一场战斗 |
+| | `quick_timeout` | 速战超过这么多秒没打完就退回 2 倍，恢复声音，保留自动战斗直到结算 | 下一场战斗 |
+| | `quick_mask` | 速战时遮住闪烁画面（默认 1） | 下一场战斗 |
+| | `quick_mute` | 速战时临时静音本游戏（默认 1），退出后恢复原来的静音状态 | 下一场战斗 |
 | | `highlight_rgb` | 高亮颜色，sRGB 十六进制，默认 `5C6CFF` | 即时 |
 
 ## 目录

@@ -9,6 +9,10 @@
 #include <xinput.h>
 #include <wincodec.h>
 #include <mmsystem.h>
+#include <shobjidl.h>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+#pragma comment(lib, "advapi32.lib")
 #include <cmath>
 #include <cstdio>
 #include <cwchar>
@@ -22,6 +26,92 @@ static void Log(const char* fmt, ...) {
     FILE* f = nullptr; if (_wfopen_s(&f, DATA_DIR L"wsmod.log", L"a") != 0 || !f) return;
     SYSTEMTIME t; GetLocalTime(&t); fprintf(f, "[%02d:%02d:%02d] ", t.wHour, t.wMinute, t.wSecond);
     va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a); fputc('\n', f); fclose(f);
+}
+
+// ============================================================ quick-battle audio (only this process)
+// Keep the user's volume and original mute state. COM objects live only on this worker, not the game thread.
+// Lua sends a heartbeat independently of the mask; after 500 ms without it, restore every session we changed.
+static volatile LONG g_muteWanted = 0, g_muteTick = 0;
+extern "C" __declspec(dllexport) int wsmod_mute_0(void*) { InterlockedExchange(&g_muteWanted, 0); return 0; }
+extern "C" __declspec(dllexport) int wsmod_mute_1(void*) {
+    InterlockedExchange(&g_muteTick, (LONG)GetTickCount());
+    InterlockedExchange(&g_muteWanted, 1); return 0;
+}
+struct MutedSession { std::wstring id; ISimpleAudioVolume* volume; BOOL original; };
+static void MuteGameSessions(IMMDeviceEnumerator* devices, std::vector<MutedSession>& saved) {
+    IMMDeviceCollection* outputs = nullptr;
+    if (FAILED(devices->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &outputs))) return;
+    UINT count = 0; outputs->GetCount(&count);
+    for (UINT d = 0; d < count; ++d) {
+        IMMDevice* device = nullptr; IAudioSessionManager2* manager = nullptr; IAudioSessionEnumerator* sessions = nullptr;
+        if (SUCCEEDED(outputs->Item(d, &device)) &&
+            SUCCEEDED(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**)&manager)) &&
+            SUCCEEDED(manager->GetSessionEnumerator(&sessions))) {
+            int n = 0; sessions->GetCount(&n);
+            for (int i = 0; i < n; ++i) {
+                IAudioSessionControl* control = nullptr; IAudioSessionControl2* info = nullptr;
+                ISimpleAudioVolume* volume = nullptr; LPWSTR instance = nullptr; DWORD pid = 0;
+                if (SUCCEEDED(sessions->GetSession(i, &control)) &&
+                    SUCCEEDED(control->QueryInterface(IID_PPV_ARGS(&info))) &&
+                    SUCCEEDED(info->GetProcessId(&pid)) && pid == GetCurrentProcessId() &&
+                    SUCCEEDED(info->GetSessionInstanceIdentifier(&instance)) && instance &&
+                    SUCCEEDED(control->QueryInterface(IID_PPV_ARGS(&volume)))) {
+                    bool known = false;
+                    for (const auto& s : saved) if (s.id == instance) { known = true; break; }
+                    if (!known) {
+                        BOOL original = FALSE;
+                        if (SUCCEEDED(volume->GetMute(&original)) && SUCCEEDED(volume->SetMute(TRUE, nullptr))) {
+                            saved.push_back({ instance, volume, original }); volume = nullptr;
+                            Log("quick battle audio muted (saved mute=%d)", (int)original);
+                        }
+                    }
+                }
+                if (instance) CoTaskMemFree(instance);
+                if (volume) volume->Release();
+                if (info) info->Release();
+                if (control) control->Release();
+            }
+        }
+        if (sessions) sessions->Release();
+        if (manager) manager->Release();
+        if (device) device->Release();
+    }
+    outputs->Release();
+    // Also hold the mute if the game refreshes its audio session settings during startup.
+    for (auto& s : saved) {
+        BOOL muted = FALSE;
+        if (SUCCEEDED(s.volume->GetMute(&muted)) && !muted) s.volume->SetMute(TRUE, nullptr);
+    }
+}
+static void RestoreGameAudio(std::vector<MutedSession>& saved) {
+    for (auto& s : saved) {
+        HRESULT hr = s.volume->SetMute(s.original, nullptr);
+        if (SUCCEEDED(hr)) Log("quick battle audio restored (mute=%d)", (int)s.original);
+        else Log("quick battle audio restore: session unavailable (0x%08lx)", (unsigned long)hr);
+        s.volume->Release();
+    }
+    saved.clear();
+}
+static DWORD WINAPI AudioThread(LPVOID) {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr)) { Log("audio worker unavailable (0x%08lx)", (unsigned long)hr); return 0; }
+    IMMDeviceEnumerator* devices = nullptr;
+    hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&devices));
+    if (FAILED(hr)) { Log("audio sessions unavailable (0x%08lx)", (unsigned long)hr); CoUninitialize(); return 0; }
+    std::vector<MutedSession> saved; DWORD lastScan = 0; bool active = false;
+    for (;;) {
+        LONG requested = InterlockedCompareExchange(&g_muteWanted, 0, 0);
+        DWORD heartbeat = (DWORD)InterlockedCompareExchange(&g_muteTick, 0, 0);
+        // Read the clock after the heartbeat: Lua can publish a newer tick while this thread is pre-empted.
+        // Subtracting that newer heartbeat from an older local tick underflows and briefly unmutes the game.
+        DWORD tick = GetTickCount();
+        bool want = requested != 0 && tick - heartbeat < 500;
+        if (want) {
+            if (!active || tick - lastScan >= 250) { MuteGameSessions(devices, saved); lastScan = tick; }
+        } else if (active) RestoreGameAudio(saved);
+        active = want;
+        Sleep(25);
+    }
 }
 
 // ============================================================ real xinput
@@ -59,6 +149,7 @@ static void LoadConfig() {
 static volatile LONG g_primary = -1;
 static volatile LONG g_mapOpen = 0;
 static volatile LONG g_battle = 0;    // in battle: everything native, mod pointer off
+static volatile LONG g_fight = 0;     // a real fight (fight.flag): Start stays native. battle.flag is also 1 on the overworld / loading
 // character screen: Lua tells us (wsmod_nav_* exports, refreshed every tick) which inputs would move the
 // focus into 属性/装备 from where it is now. Those presses are hidden from the game and reported to Lua in
 // trig.req ("L"/"R" = LT/RT, "<" ">" "^" "v" = d-pad or left stick), Lua then jumps itself -> no flash.
@@ -311,6 +402,9 @@ static DWORD WINAPI MouseThread(LPVOID) {
             std::wstring bs = ReadSmallFile(L"battle.flag");
             LONG nb = (!bs.empty() && bs[0] == L'1') ? 1 : 0;
             if (nb != g_battle) { g_battle = nb; Log("battle %s: right stick %s", nb ? "start" : "end", nb ? "native" : "mouse"); }
+            std::wstring fs = ReadSmallFile(L"fight.flag");
+            LONG nf = (!fs.empty() && fs[0] == L'1') ? 1 : 0;
+            if (nf != g_fight) { g_fight = nf; Log("fight %s: Start %s", nf ? "start" : "end", nf ? "native" : "-> character screen"); }
         }
         bool active = GameFocused() && !g_mapOpen && !g_menuOpen && !g_battle;
         LONG idx = g_primary; XINPUT_STATE st{};
@@ -601,20 +695,20 @@ static LRESULT CALLBACK OsdProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
 static volatile LONG g_spdLevel = 0; static volatile DWORD g_spdTime = 0;
 static HWND g_spdWnd; static HFONT fSpd; static int g_spdFontPx = 0; static LONG g_spdPainted = -1;
 #define SPD_EXPORT(n) extern "C" __declspec(dllexport) int wsmod_speed_##n(void*) { g_spdLevel = n; g_spdTime = GetTickCount(); return 0; }
-SPD_EXPORT(0) SPD_EXPORT(1) SPD_EXPORT(2) SPD_EXPORT(3) SPD_EXPORT(4)
+SPD_EXPORT(0) SPD_EXPORT(1) SPD_EXPORT(2) SPD_EXPORT(3) SPD_EXPORT(4) SPD_EXPORT(5) SPD_EXPORT(6)   // 5 = 速战 badge, 6 = 速战 mask
 static LRESULT CALLBACK SpdProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_TIMER: {
         LONG lv = g_spdLevel;
         HWND gw = GameWindow();
-        bool show = lv >= 1 && GetTickCount() - g_spdTime < 500 && gw && !g_menuOpen;
+        bool show = lv >= 1 && lv != 6 && GetTickCount() - g_spdTime < 500 && gw && !g_menuOpen;
         if (!show) { if (IsWindowVisible(h)) ShowWindow(h, SW_HIDE); return 0; }
         RECT cr; GetClientRect(gw, &cr); POINT a{ cr.left, cr.top }, b{ cr.right, cr.bottom };
         ClientToScreen(gw, &a); ClientToScreen(gw, &b);
         double H = (double)(b.y - a.y); if (H < 100) return 0;
         int size = (int)(H * 0.092);
         int cx = b.x - (int)(H * 87.0 / 720.0), cy = a.y + (int)(H * 85.0 / 720.0);
-        int fpx = (int)(size * 0.40);
+        int fpx = (int)(size * (lv == 5 ? 0.27 : 0.40));
         if (fpx != g_spdFontPx) { if (fSpd) DeleteObject(fSpd); fSpd = CreateFontW(-fpx, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Microsoft YaHei"); g_spdFontPx = fpx; g_spdPainted = -1; }
         SetWindowPos(h, HWND_TOPMOST, cx - size / 2, cy - size / 2, size, size, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         if (g_spdPainted != lv) { g_spdPainted = lv; InvalidateRect(h, nullptr, FALSE); }
@@ -637,13 +731,133 @@ static LRESULT CALLBACK SpdProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         Polygon(mem, inner, 4);
         SelectObject(mem, obr); SelectObject(mem, op); DeleteObject(bf); DeleteObject(pe); DeleteObject(pi);
         SetBkMode(mem, TRANSPARENT);
-        wchar_t t[8]; swprintf_s(t, L"\u00d7%ld", (long)g_spdLevel);
+        wchar_t t[8]; if (g_spdLevel == 5) wcscpy_s(t, L"\u901f\u6218"); else swprintf_s(t, L"\u00d7%ld", (long)g_spdLevel);
         Text(mem, t, { 0, 0, W, H }, RGB(240, 236, 228), fSpd, DT_CENTER | DT_VCENTER);
         BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
         SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem); EndPaint(h, &ps); return 0;
     }
     }
     return DefWindowProcW(h, m, wp, lp);
+}
+
+// ============================================================ 速战 mask (level 6)
+// At x50 the battle camera, cut-ins and the HUD switch every few frames, which flickers. While Lua runs 速战 with
+// quick_mask = 1 it calls wsmod_speed_6 every tick; we cover the game's client area with an opaque ink panel
+// ("速战中") until the result screen (Lua then calls wsmod_speed_0). Click-through, never activated.
+static HWND g_maskWnd; static HFONT fMaskBig, fMaskSmall; static int g_maskFontH = 0; static DWORD g_maskSince = 0;
+static RECT g_maskRect{};
+static LRESULT CALLBACK MaskProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_TIMER: {
+        LONG lv = g_spdLevel;
+        HWND gw = GameWindow();
+        bool show = lv == 6 && GetTickCount() - g_spdTime < 500 && gw && !g_menuOpen;
+        if (!show) { if (IsWindowVisible(h)) { ShowWindow(h, SW_HIDE); Log("quick battle mask off"); } g_maskSince = 0; return 0; }
+        RECT cr; GetClientRect(gw, &cr); POINT a{ cr.left, cr.top }, b{ cr.right, cr.bottom };
+        ClientToScreen(gw, &a); ClientToScreen(gw, &b);
+        RECT r{ a.x, a.y, b.x, b.y };
+        int H = r.bottom - r.top; if (H < 100) return 0;
+        if (H != g_maskFontH) {
+            if (fMaskBig) DeleteObject(fMaskBig); if (fMaskSmall) DeleteObject(fMaskSmall);
+            fMaskBig = CreateFontW(-(int)(H * 0.070), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Microsoft YaHei");
+            fMaskSmall = CreateFontW(-(int)(H * 0.024), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Microsoft YaHei");
+            g_maskFontH = H;
+        }
+        if (!g_maskSince) { g_maskSince = GetTickCount(); Log("quick battle mask on (%dx%d)", r.right - r.left, H); }
+        if (!EqualRect(&r, &g_maskRect) || !IsWindowVisible(h)) {
+            g_maskRect = r;
+            SetWindowPos(h, HWND_TOPMOST, r.left, r.top, r.right - r.left, H, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+        InvalidateRect(h, nullptr, FALSE);      // dots + seconds
+        return 0;
+    }
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT r; GetClientRect(h, &r); int Wd = r.right, H = r.bottom;
+        HDC mem = CreateCompatibleDC(dc); HBITMAP bmp = CreateCompatibleBitmap(dc, Wd, H); HGDIOBJ ob = SelectObject(mem, bmp);
+        const COLORREF INK = RGB(20, 18, 16), GOLD = RGB(206, 170, 98), PAPER = RGB(236, 226, 204), DIM = RGB(140, 128, 108);
+        Fill(mem, r, INK);
+        int cx = Wd / 2, cy = H / 2, lw = (int)(H * 0.28);
+        Fill(mem, { cx - lw, cy - (int)(H * 0.075), cx + lw, cy - (int)(H * 0.075) + 2 }, GOLD);
+        Fill(mem, { cx - lw, cy + (int)(H * 0.075), cx + lw, cy + (int)(H * 0.075) + 2 }, GOLD);
+        SetBkMode(mem, TRANSPARENT);
+        DWORD el = g_maskSince ? (GetTickCount() - g_maskSince) : 0;
+        int dots = (int)((el / 400) % 4);
+        wchar_t t[32]; swprintf_s(t, L"\u901f \u6218 \u4e2d%s", dots == 0 ? L"" : dots == 1 ? L"\u00b7" : dots == 2 ? L"\u00b7\u00b7" : L"\u00b7\u00b7\u00b7");
+        Text(mem, t, { 0, cy - (int)(H * 0.07), Wd, cy + (int)(H * 0.07) }, PAPER, fMaskBig, DT_CENTER | DT_VCENTER);
+        wchar_t s[96]; swprintf_s(s, L"%lu \u79d2   \u00b7   \u518d\u6309\u52a0\u901f\u952e\u9000\u51fa\u901f\u6218", el / 1000);
+        Text(mem, s, { 0, cy + (int)(H * 0.10), Wd, cy + (int)(H * 0.15) }, DIM, fMaskSmall, DT_CENTER | DT_VCENTER);
+        BitBlt(dc, 0, 0, Wd, H, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem); EndPaint(h, &ps); return 0;
+    }
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+// test only: render the mask into DATA\mask_snap.bmp (1280x720) without showing it, to check the layout
+extern "C" __declspec(dllexport) int wsmod_mask_snap(void*) {
+    const int Wd = 1280, H = 720;
+    HDC sdc = GetDC(nullptr); HDC mem = CreateCompatibleDC(sdc);
+    BITMAPINFO bi{}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = Wd; bi.bmiHeader.biHeight = -H; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 24;
+    void* bits = nullptr; HBITMAP bmp = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0); HGDIOBJ ob = SelectObject(mem, bmp);
+    HFONT big = CreateFontW(-(int)(H * 0.070), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Microsoft YaHei");
+    HFONT sm = CreateFontW(-(int)(H * 0.024), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Microsoft YaHei");
+    RECT r{ 0, 0, Wd, H }; Fill(mem, r, RGB(20, 18, 16));
+    int cx = Wd / 2, cy = H / 2, lw = (int)(H * 0.28);
+    Fill(mem, { cx - lw, cy - (int)(H * 0.075), cx + lw, cy - (int)(H * 0.075) + 2 }, RGB(206, 170, 98));
+    Fill(mem, { cx - lw, cy + (int)(H * 0.075), cx + lw, cy + (int)(H * 0.075) + 2 }, RGB(206, 170, 98));
+    SetBkMode(mem, TRANSPARENT);
+    Text(mem, L"\u901f \u6218 \u4e2d\u00b7\u00b7", { 0, cy - (int)(H * 0.07), Wd, cy + (int)(H * 0.07) }, RGB(236, 226, 204), big, DT_CENTER | DT_VCENTER);
+    Text(mem, L"3 \u79d2   \u00b7   \u518d\u6309\u52a0\u901f\u952e\u9000\u51fa\u901f\u6218", { 0, cy + (int)(H * 0.10), Wd, cy + (int)(H * 0.15) }, RGB(140, 128, 108), sm, DT_CENTER | DT_VCENTER);
+    GdiFlush();
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, DATA_DIR L"mask_snap.bmp", L"wb") == 0 && f) {
+        int row = ((Wd * 3 + 3) / 4) * 4; DWORD img = row * H;
+        BITMAPFILEHEADER fh{}; fh.bfType = 0x4D42; fh.bfOffBits = sizeof(fh) + sizeof(bi.bmiHeader); fh.bfSize = fh.bfOffBits + img;
+        BITMAPINFOHEADER ih = bi.bmiHeader; ih.biHeight = H;               // bottom-up for the file
+        fwrite(&fh, sizeof(fh), 1, f); fwrite(&ih, sizeof(ih), 1, f);
+        for (int y = H - 1; y >= 0; y--) fwrite((BYTE*)bits + y * row, row, 1, f);
+        fclose(f);
+    }
+    SelectObject(mem, ob); DeleteObject(bmp); DeleteObject(big); DeleteObject(sm); DeleteDC(mem); ReleaseDC(nullptr, sdc);
+    return 0;
+}
+
+// ============================================================ test instance on another virtual desktop
+// If DATA\test_desktop.txt contains N (1-based), the game window is moved to virtual desktop N as soon as it
+// exists (IVirtualDesktopManager works for windows of the calling process, and this DLL runs in the game).
+// For background testing only; normal starts (no file) are unaffected.
+static BOOL CALLBACK FindGameWnd(HWND h, LPARAM lp) {
+    DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    wchar_t cls[64]; GetClassNameW(h, cls, 64);
+    if (wcscmp(cls, L"UnrealWindow") != 0) return TRUE;
+    *(HWND*)lp = h; return FALSE;
+}
+static DWORD WINAPI DesktopThread(LPVOID) {
+    std::wstring s = ReadSmallFile(L"test_desktop.txt");
+    int n = s.empty() ? 0 : _wtoi(s.c_str());
+    if (n < 1) return 0;
+    BYTE ids[16 * 32]; DWORD sz = sizeof(ids);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops",
+        L"VirtualDesktopIDs", RRF_RT_REG_BINARY, nullptr, ids, &sz) != ERROR_SUCCESS || sz < (DWORD)(16 * n)) { Log("test desktop %d: not found", n); return 0; }
+    GUID gd; memcpy(&gd, ids + 16 * (n - 1), 16);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    IVirtualDesktopManager* vdm = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_VirtualDesktopManager, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&vdm))) || !vdm) { Log("test desktop: no IVirtualDesktopManager"); return 0; }
+    DWORD t0 = GetTickCount(); int moved = 0;
+    while (GetTickCount() - t0 < 60000 && moved < 3) {
+        HWND gw = nullptr; EnumWindows(FindGameWnd, (LPARAM)&gw);
+        if (gw) {
+            GUID cur{}; BOOL on = FALSE;
+            if (SUCCEEDED(vdm->GetWindowDesktopId(gw, &cur)) && memcmp(&cur, &gd, sizeof(GUID)) == 0) moved++;
+            else { HRESULT hr = vdm->MoveWindowToDesktop(gw, gd); Log("test desktop %d: move game window hr=0x%08lx", n, (unsigned long)hr); (void)on; }
+        }
+        Sleep(30);
+    }
+    vdm->Release();
+    return 0;
 }
 
 // keyboard: F opens on the world map; while the panel is open its keys are swallowed so the game does not react
@@ -690,6 +904,10 @@ static DWORD WINAPI MenuThread(LPVOID) {
     g_spdWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
         ws.lpszClassName, L"", WS_POPUP, 0, 0, 60, 60, nullptr, nullptr, g_self, nullptr);
     SetLayeredWindowAttributes(g_spdWnd, RGB(255, 0, 255), 250, LWA_COLORKEY | LWA_ALPHA); SetTimer(g_spdWnd, 1, 40, nullptr);
+    WNDCLASSW wk{}; wk.lpfnWndProc = MaskProc; wk.hInstance = g_self; wk.lpszClassName = L"WSModMask"; RegisterClassW(&wk);
+    g_maskWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+        wk.lpszClassName, L"", WS_POPUP, 0, 0, 100, 100, nullptr, nullptr, g_self, nullptr);
+    SetLayeredWindowAttributes(g_maskWnd, 0, 250, LWA_ALPHA); SetTimer(g_maskWnd, 1, 40, nullptr);
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, g_self, 0);
     Log("teleport panel ready (kb hook %s)", g_kbHook ? "ok" : "failed");
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);
@@ -743,12 +961,30 @@ static DWORD WINAPI KeyTapThread(LPVOID p) {
     return 0;
 }
 static bool g_prevStart;
+// Start: ask Lua to open the character screen's team tab (no keyboard event, so the game's input mode stays).
+// Lua answers in start.ack; "0" or no answer in 0.6 s -> tap B as before.
+static volatile LONG g_startBusy = 0;
+static DWORD WINAPI StartThread(LPVOID) {
+    DeleteFileW(DATA_DIR L"start.ack");
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, DATA_DIR L"start.req", L"wb") == 0 && f) { fputc('1', f); fclose(f); }
+    wchar_t ans = 0;
+    for (int i = 0; i < 60 && !ans; i++) {
+        Sleep(10);
+        std::wstring a = ReadSmallFile(L"start.ack");
+        if (!a.empty()) ans = a[0];
+    }
+    DeleteFileW(DATA_DIR L"start.ack"); DeleteFileW(DATA_DIR L"start.req");
+    if (ans == L'1') Log("Start -> character screen (team tab, input mode kept)");
+    else { KeyTapThread((LPVOID)(UINT_PTR)0x30); Log("Start -> character screen (B%s)", ans ? "" : ", Lua did not answer"); }   // 0x30 = B
+    InterlockedExchange(&g_startBusy, 0);
+    return 0;
+}
 static void PadStartRemap(XINPUT_GAMEPAD& g) {
     bool st = (g.wButtons & XINPUT_GAMEPAD_START) != 0;
-    if (st && !g_prevStart) {
-        HANDLE t = CreateThread(nullptr, 0, KeyTapThread, (LPVOID)(UINT_PTR)0x30, 0, nullptr);   // 0x30 = B
-        if (t) CloseHandle(t);
-        Log("Start -> character screen (B)");
+    if (st && !g_prevStart && InterlockedCompareExchange(&g_startBusy, 1, 0) == 0) {
+        HANDLE t = CreateThread(nullptr, 0, StartThread, nullptr, 0, nullptr);
+        if (t) CloseHandle(t); else InterlockedExchange(&g_startBusy, 0);
     }
     g_prevStart = st;
     g.wButtons &= ~XINPUT_GAMEPAD_START;
@@ -810,10 +1046,17 @@ static DWORD Handle(PFN_GetState fn, DWORD idx, XINPUT_STATE* s) {
     XINPUT_GAMEPAD& g = s->Gamepad;
     bool focus = GameFocused();
     if (focus && !g_menuOpen) PadPrime(g);
-    if (focus && !g_battle) { if (!g_menuOpen) PadSpeedCombo(g); PadMenu(g); }
+    // the world map cannot be open during a real fight, but battle.flag is also 1 on the overworld (LV_World):
+    // map state wins, so Y / the teleport panel work when the map is opened from the overworld
+    if (focus && (!g_battle || g_mapOpen || g_menuOpen)) { if (!g_menuOpen) PadSpeedCombo(g); PadMenu(g); }
     if (g_menuOpen) { ReleaseClick(); ZeroMemory(&g, sizeof(g)); return r; }                    // panel owns the pad
-    if (g_battle) { ReleaseClick(); g_ptrMode = 0; g_prevA = false; g_prevStart = (g.wButtons & XINPUT_GAMEPAD_START) != 0; return r; } // battle: all native
     if (g_mapOpen) { ReleaseClick(); g.wButtons &= ~XINPUT_GAMEPAD_Y; return r; }               // map: native except Y
+    if (g_battle) {                                                                              // battle: all native...
+        ReleaseClick(); g_ptrMode = 0; g_prevA = false;
+        if (focus && !g_fight) PadStartRemap(g);                                                  // ...except Start outside a real fight
+        else g_prevStart = (g.wButtons & XINPUT_GAMEPAD_START) != 0;
+        return r;
+    }
     if (focus) { PadStartRemap(g); PadPointerClick(g); } else ReleaseClick();
     g.sThumbRX = 0; g.sThumbRY = 0;                                     // right stick belongs to the mouse; R3 stays native
     return r;
@@ -840,6 +1083,8 @@ static BOOL CALLBACK InitReal(PINIT_ONCE, PVOID, PVOID*) {
     CreateThread(nullptr, 0, CursorThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, MenuThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, MouseThread, nullptr, 0, nullptr);
+    HANDLE audio = CreateThread(nullptr, 0, AudioThread, nullptr, 0, nullptr);
+    if (audio) CloseHandle(audio); else Log("audio worker failed to start (%lu)", GetLastError());
     return TRUE;
 }
 static void Init() { InitOnceExecuteOnce(&g_once, InitReal, nullptr, nullptr); }
@@ -858,7 +1103,10 @@ DWORD WINAPI Proxy_102(DWORD a) { Init(); return p102 ? p102(a) : ERROR_DEVICE_N
 DWORD WINAPI Proxy_103(DWORD a) { Init(); return p103 ? p103(a) : ERROR_DEVICE_NOT_CONNECTED; }
 }
 BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
-    if (r == DLL_PROCESS_ATTACH) { g_self = h; DisableThreadLibraryCalls(h); SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0); }
+    if (r == DLL_PROCESS_ATTACH) {
+        g_self = h; DisableThreadLibraryCalls(h); SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0);
+        if (GetFileAttributesW(DATA_DIR L"test_desktop.txt") != INVALID_FILE_ATTRIBUTES) { HANDLE t = CreateThread(nullptr, 0, DesktopThread, nullptr, 0, nullptr); if (t) CloseHandle(t); }
+    }
     if (r == DLL_PROCESS_DETACH) { if (g_sysHidden) SystemParametersInfoW(SPI_SETCURSORS, 0, nullptr, 0); ClipCursor(nullptr); }
     return TRUE;
 }
