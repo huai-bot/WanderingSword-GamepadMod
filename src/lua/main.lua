@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.12 loaded\n")
+print("[GamepadTweaks] v4.14 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -439,9 +439,21 @@ end
 local HOOK_FN = "/Game/JH/JHNeoUI/Modules/Shared/Backpack/Comps/Grid/BP_ItemGridWDT.BP_ItemGridWDT_C:BP_OnEntryInitialized_Event_0"
 local HIDE = { vm = nil, findAt = 0, open = false, view = nil, grid = nil, gridAddr = nil, vn = nil, team = nil, btns = {},
   hooked = false, hookCount = 0, lastHook = 0, sig = nil, recheckAt = nil, removed = 0, lastNpc = nil, lastFilter = nil,
-  memo = {}, info = {}, wtype = {}, dim = {}, dimWt = {}, recipeDone = {}, srcN = -1, cfgHide = true, cfgTidy = true,
+  memo = {}, info = {}, wtype = {}, dim = {}, dimWt = {}, recipeDone = {}, bookDone = {}, srcN = -1, cfgHide = true, cfgTidy = true,
   cacheAt = -1, cacheNpc = 0, cacheFilter = -1 }
 
+-- 学成 manuals: the cell's display data says "is_acquired":true (the game's 学成 mark). This is not the same as
+-- "the focused character knows the skill" (HasSkillById): most 学成 books are known by nobody in the team.
+-- The flag is the same for every character, so it is learned once from the cells and kept in acquired_books.txt,
+-- which lets the next opening hide those books before they are drawn.
+do
+  local s = readFirst("acquired_books.txt")
+  if s then for id in s:gmatch("%d+") do HIDE.bookDone[tonumber(id)] = true end end
+end
+local function saveBooks()
+  local t = {} for id in pairs(HIDE.bookDone) do t[#t + 1] = tostring(id) end table.sort(t)
+  writeFile("acquired_books.txt", table.concat(t, "\n") .. "\n")
+end
 local function teamInfo(npc)
   local i = HIDE.info[npc]
   if i and i:IsValid() then return i end
@@ -486,9 +498,10 @@ local function decide(npc, defId)
     if k.sub >= 30 and k.sub <= 38 then
       local info = teamInfo(npc); local has = false
       if k.skill and info and info:IsValid() then pcall(function() has = info:HasSkillById(k.skill) end) end
-      if has then d = "a"                                                        -- 学成: only in 秘籍
-      elseif npc ~= 0 and k.sub <= 35 then
-        local wt = weaponType(npc); if wt > 0 and (k.sub - 29) ~= wt then d = "u" end   -- teammate cannot learn other weapon arts
+      if has then d = "a"                                                        -- known: only in 秘籍
+      elseif npc ~= 0 and k.sub <= 35 and weaponType(npc) > 0 and (k.sub - 29) ~= weaponType(npc) then
+        d = "u"                                                                  -- teammate cannot learn other weapon arts
+      elseif HIDE.bookDone[defId] then d = "a"                                   -- 学成 (game's mark): only in 秘籍
       end
     elseif k.sub == 60 or (k.sub >= 40 and k.sub <= 49) then d = "a"            -- quest items, materials
     elseif k.sub >= 50 and k.sub <= 56 then d = "a"                             -- 珍宝: paintings, chess, tea sets, books, lyre, treasures, flowers
@@ -626,6 +639,11 @@ local function taskHide()
             HIDE.dim[npc] = HIDE.dim[npc] or {}; HIDE.dim[npc][sid] = true; HIDE.memo[npc][sid] = "u"; newly = true
           elseif js:find('"is_recipe":true', 1, true) and js:find('"is_acquired":true', 1, true) and not HIDE.recipeDone[sid] then
             HIDE.recipeDone[sid] = true; for _, mm in pairs(HIDE.memo) do mm[sid] = nil end; newly = true
+          elseif not HIDE.bookDone[sid] and js:find('"is_acquired":true', 1, true) then
+            local it = tonumber(js:match('"item_type":(%d+)'))
+            if it and it >= 30 and it <= 38 then
+              HIDE.bookDone[sid] = true; for _, mm in pairs(HIDE.memo) do mm[sid] = nil end; newly = true; saveBooks()
+            end
           end
           if newly and isHidden(npc, filter, sid) then grid:RemoveItem(sp); gone[addr] = true; learnt = learnt + 1 end
         end
@@ -764,13 +782,18 @@ local function navFocus(target)
     for _, bn in ipairs(NAV_BTNS) do local b = NAV.team[bn]; if b and b:IsValid() and b:IsVisible() then b:SetFocus(); return end end
     return
   end
+  -- side bar with a remembered cell: focus that cell's button directly. Going through ChangeNaviFocus("SideBar")
+  -- makes the game re-focus its default cell ~0.5 s later (measured 2026-11-23), which undid the memory.
+  local c = NAV.sideCell
+  if target == "SideBar" and c and c:IsValid() and c:IsVisible() then
+    local b = c.BTN_SidebarCell
+    if b and b:IsValid() then b:SetFocus() else c:SetFocus() end
+    return
+  end
   local w = NAV.vm:ChangeNaviFocus(FName(target), 0, "")
   if w and w:IsValid() then w:SetFocus() end
   -- come back to where we were inside the region (same frame, so the default cell is never drawn focused)
-  if target == "SideBar" then
-    local c = NAV.sideCell
-    if c and c:IsValid() and c:IsVisible() then c:SetFocus() end
-  elseif target == "Backpack" then
+  if target == "Backpack" then
     local g = HIDE.grid
     if g and g:IsValid() then
       local n = g:GetNumItems()
@@ -788,17 +811,25 @@ local function navInstead()
   if base == "Backpack" then return "SideBar" end
   return NAV.beforeBottom or "SideBar"
 end
+OBS_HOOK = nil            -- set by the 观察 section below
 local function navHook()
   if NAV.hooked then return end
   NAV.hooked = true
   local ok, e = pcall(function()
     RegisterHook("/Script/NeoUI.NeoUIUniversalModuleVMBase:ChangeNaviFocus", function(self, id, scen, str)
-      if NAV.self or not NAV.open or not NAV.cfg then return end
+      if NAV.self then return end
+      if OBS_HOOK and OBS_HOOK(self, id) then return end
+      if not NAV.open or not NAV.cfg then return end
       local key = id:get():ToString()
       if key ~= "Property" and key ~= "Equip" then return end
       local t = navInstead()
       if t == "Bottom" then t = "SideBar" end
-      id:set(FName(t))
+      local c = NAV.sideCell
+      if t == "SideBar" and c and c:IsValid() and c:IsVisible() then
+        id:set(FName("ModSkip"))          -- no such module: the call does nothing; navFocus focuses the remembered cell
+      else
+        id:set(FName(t))
+      end
       NAV.rewrites = NAV.rewrites + 1
       -- the game lands on the region's default element; next tick navFocus puts it on the remembered one
       -- (Backpack also needs that SetFocus to take the focus at all)
@@ -835,7 +866,11 @@ do
   print("[GamepadTweaks] nav: proxy input filter " .. (NAVX and "available" or "missing (old xinput1_3.dll, LT/RT only)") .. "\n")
 end
 local NAV_BITS = { up = 1, down = 2, left = 4, right = 8, trig = 16 }
-local function navMask(m)
+local MASKS = { prime = 0, obs = 0 }
+local PADEV = nil        -- proxy events ("L" "R" "<" ">" "^" "v") of this tick, read once by taskPadEv
+local navMask
+local function maskSet(owner, m) MASKS[owner] = m; navMask(MASKS.prime | MASKS.obs) end
+function navMask(m)
   if NAVX then
     if m ~= 0 or NAV.mask ~= 0 then
       NAVX.begin()
@@ -848,7 +883,7 @@ local function navMask(m)
   end
   NAV.mask = m
 end
-local function navFlag(on) if not on then navMask(0) end end
+local function navFlag(on) if not on then maskSet("prime", 0) end end
 -- "L"/"R" events from the proxy (renamed first so an append racing with the read is never lost)
 local function navPadEvents()
   if not os.rename(DIR .. "trig.req", DIR .. "trig.take") then return nil end
@@ -871,7 +906,7 @@ local function taskNav()
     NAV.team, NAV.open = t, false
     if not t then return end
   end
-  if not t:IsVisible() then NAV.open = false; navFlag(false); navPadEvents() return end
+  if not t:IsVisible() then NAV.open = false; navFlag(false) return end
   if not NAV.open then
     NAV.open, NAV.cur, NAV.stable, NAV.want, NAV.pending, NAV.beforeBottom = true, nil, nil, nil, nil, "SideBar"
     NAV.cells, NAV.sideCell, NAV.bpIdx, NAV.force = nil, nil, 0, false
@@ -888,8 +923,8 @@ local function taskNav()
   end
   if not NAV.cfg or not (NAV.vm and NAV.vm:IsValid() and NAV.im and NAV.im:IsValid()) then navFlag(false) return end
   local cur = navRegion()
-  local ev = navPadEvents()
-  if ev and (NAV.mask ~= 0 or NAV.flag) then
+  local ev = PADEV
+  if ev and (MASKS.prime ~= 0 or NAV.flag) then
     for ch in ev:gmatch("[LR<>%^v]") do
       local base = NAV.want or NAV.stable or (NAV_IDX[cur] and cur) or "SideBar"
       NAV.pending = nil
@@ -906,7 +941,7 @@ local function taskNav()
   local pad = true; pcall(function() pad = NAV.im:IsGamepadMode() end)
   -- the game moves the focus when LT/RT is RELEASED (measured: ~1 press length after the press), so the
   -- target is chosen on press and applied on release; navGo then holds it for 0.3 s against late moves
-  if pressed ~= 0 and cur and pad then
+  if pressed ~= 0 and cur then
     local base = NAV.stable or (NAV_IDX[cur] and cur) or "SideBar"
     NAV.pending, NAV.pendingWhy, NAV.want = navStep(base, pressed), pressed > 0 and "RT" or "LT", nil
   end
@@ -959,9 +994,235 @@ local function taskNav()
   local m = 0
   if r == "SideBar" or r == "Backpack" or r == "Bottom" or r == "Property" or r == "Equip" then m = NAV_BITS.trig end
   if r == "SideBar" then m = m | NAV_BITS.right elseif r == "Bottom" then m = m | NAV_BITS.up end
-  if not pad then m = 0 end
-  navMask(m)
+  maskSet("prime", m)                 -- also in mouse mode: it only filters gamepad input
   NAV.cur = cur
+end
+
+-- ---------------------------------------------------------------- 10b) 观察 screen (BPMV_Observe_C): skip 属性 / 装备 for the gamepad
+-- Regions left for the gamepad: 背包 (Backpack) and the bottom buttons (切磋/送礼/请教/击杀/离队). LT/RT switch between
+-- the two, the screen opens on the first bottom button (切磋), UP on the bottom row goes to the backpack.
+-- The game itself (v1.24.32, measured 2026-11-23 with injected input):
+--   opens on 属性 (DefaultFocusModuleKey = Property); LT/RT do nothing; LB/RB switch backpack tabs
+--   backpack left edge -> ChangeNaviFocus("Equip", 3); 装备 left -> ChangeNaviFocus("Property", 3)
+--   属性 DOWN x5 -> bottom row (widget navigation); bottom row UP -> 属性 (widget navigation)
+-- We: proxy blocks LT/RT everywhere and UP on the bottom row (events in trig.req); the ChangeNaviFocus hook turns
+-- every game request for Property/Equip (observe VM or its sub-module VMs) into "SideBar" (a key this screen does not have, so
+-- the call does nothing and the focus stays where it is, e.g. the backpack's left edge simply stops).
+local OBS = { view = nil, vm = nil, findAt = 0, open = false, cfg = true, stable = nil, want = nil, wantUntil = 0,
+  tries = 0, lastTry = 0, force = false, grid = nil, bpView = nil, bpIdx = 0, btn = nil, memAt = 0, vn = nil, rewrites = 0 }
+local OBS_BTNS = { "BTN_QieCuo", "BTN_SongLi", "BTN_QingJiao", "BTN_JiSha", "BTN_LiDui" }      -- left to right
+local function obsFD(w) return w and w:IsValid() and w:IsVisible() and w:HasFocusedDescendants() end
+local function obsBtnOn(b)
+  if not (b and b:IsValid() and b:IsVisible()) then return false end
+  if b:HasFocusedDescendants() then return true end
+  local bg = b.JHGPCBtn_ActiveBG
+  return bg and bg:IsValid() and bg:IsVisible() or false
+end
+local function obsRegion()
+  local v = OBS.view
+  for _, cn in ipairs({ "BPMV_Observe_Property_C" }) do
+    for _, x in ipairs(FindAllOf(cn) or {}) do if live(x) and obsFD(x) then return "Property" end end
+  end
+  for _, x in ipairs(FindAllOf("BPMV_Team_Equip_V3_C") or {}) do if live(x) and obsFD(x) then return "Equip" end end
+  local bv = OBS.bpView
+  if bv and bv:IsValid() and obsFD(bv) then return "Backpack" end
+  for _, bn in ipairs(OBS_BTNS) do local b = v[bn]; if obsBtnOn(b) then return "Bottom", b end end
+  return nil
+end
+local function obsFirstBtn()
+  local b = OBS.btn
+  if b and b:IsValid() and b:IsVisible() then return b end
+  for _, bn in ipairs(OBS_BTNS) do local x = OBS.view[bn]; if x and x:IsValid() and x:IsVisible() then return x end end
+  return nil
+end
+local function obsFocus(target)
+  NAV.self = true
+  local ok, e = pcall(function()
+    if target == "Bottom" then
+      local b = obsFirstBtn(); if b then b:SetFocus() end
+    else
+      local w = OBS.vm:ChangeNaviFocus(FName("Backpack"), 0, "")
+      if w and w:IsValid() then w:SetFocus() end
+      local g = OBS.grid
+      if g and g:IsValid() then local n = g:GetNumItems(); if n > 0 then g:NavigateToIndex(math.min(OBS.bpIdx or 0, n - 1)) end end
+    end
+  end)
+  NAV.self = false
+  if not ok then error(e) end
+end
+local function obsGo(target, why, hold)
+  OBS.want, OBS.wantUntil, OBS.tries, OBS.lastTry, OBS.force = target, now() + (hold or 0.3), 0, 0, true
+  print(string.format("[GamepadTweaks] observe nav %s -> %s (%s)\n", tostring(OBS.stable), target, why))
+end
+-- the request comes from the observe VM (opening) or from a sub-module VM (backpack left edge: JHBackpackVMBase),
+-- so every request while the 观察 screen is shown counts
+OBS_HOOK = function(self, id)
+  if not OBS.cfg then return false end                 -- not OBS.open: also the opening request, before taskObs saw it
+  local v = OBS.view
+  if not (v and v:IsValid() and v:IsVisible()) then return false end
+  local key = id:get():ToString()
+  if key == "Property" or key == "Equip" then
+    id:set(FName("SideBar"))
+    OBS.rewrites = OBS.rewrites + 1
+    print("[GamepadTweaks] observe nav: game asked for " .. key .. ", ignored\n")
+  end
+  return true
+end
+local function taskObs()
+  local v = OBS.view
+  if not (v and v:IsValid()) then
+    if now() < OBS.findAt then return end
+    OBS.findAt = now() + 1
+    v = nil; for _, x in ipairs(FindAllOf("BPMV_Observe_C") or {}) do if live(x) then v = x end end
+    OBS.view, OBS.open = v, false
+    if not v then return end
+    OBS.cfg = iniNumber("prime_skip_panels", 1) == 1
+    if OBS.cfg then navHook() end
+  end
+  if not v:IsVisible() then if OBS.open then OBS.open = false; maskSet("obs", 0) end return end
+  if not OBS.open then
+    OBS.open, OBS.stable, OBS.want, OBS.bpIdx, OBS.btn = true, nil, nil, 0, nil
+    OBS.cfg = iniNumber("prime_skip_panels", 1) == 1
+    if OBS.cfg then navHook() end
+    OBS.vm = v:GetNeoUIVM()
+    OBS.vn = v:GetFName():ToString()
+    OBS.grid, OBS.bpView = nil, nil
+    for _, x in ipairs(FindAllOf("BPMV_JHBackpack_Basic_C") or {}) do
+      if live(x) and x:IsVisible() then local g = x.GRID_ITEM; if g and g:IsValid() then OBS.grid, OBS.bpView = g, x end end
+    end
+    if OBS.cfg then local c0 = obsRegion(); obsGo("Bottom", "open, game focused " .. tostring(c0), 1.0) end
+  end
+  if not OBS.cfg or not (OBS.vm and OBS.vm:IsValid()) then maskSet("obs", 0) return end
+  local cur, btn = obsRegion()
+  local pad = true; pcall(function() pad = NAV.im and NAV.im:IsValid() and NAV.im:IsGamepadMode() end)
+  if not NAV.im then pcall(function() for _, s in ipairs(FindAllOf("NeoUISubsystem") or {}) do if live(s) then NAV.im = s.InputManager end end end) end
+  local ev = PADEV
+  if ev and MASKS.obs ~= 0 then
+    for ch in ev:gmatch("[LR<>%^v]") do
+      local base = OBS.want or OBS.stable or cur or "Bottom"
+      if ch == "L" or ch == "R" then obsGo(base == "Bottom" and "Backpack" or "Bottom", ch .. "T pad")
+      elseif ch == "^" and base == "Bottom" then obsGo("Backpack", "up pad") end
+    end
+  end
+  if pad and not OBS.want and (cur == "Property" or cur == "Equip") then
+    obsGo(OBS.stable or "Bottom", "landed on " .. cur)
+  end
+  if OBS.want then
+    if now() > OBS.wantUntil then
+      if cur ~= OBS.want then print(string.format("[GamepadTweaks] observe nav: gave up on %s (at %s)\n", OBS.want, tostring(cur))) end
+      OBS.want = nil
+    elseif (OBS.force or cur ~= OBS.want) and OBS.tries < 20 and now() - OBS.lastTry >= 0.035 then
+      OBS.tries, OBS.lastTry, OBS.force = OBS.tries + 1, now(), false
+      pcall(obsFocus, OBS.want)
+      cur, btn = obsRegion()
+    end
+  end
+  if (cur == "Backpack" or cur == "Bottom") and not OBS.want then
+    OBS.stable = cur
+    if cur == "Bottom" and btn then OBS.btn = btn end
+    if cur == "Backpack" and now() - OBS.memAt > 0.06 then
+      OBS.memAt = now()
+      pcall(function()
+        local g = OBS.grid
+        for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
+          if en:IsValid() and en:IsVisible() and en:HasFocusedDescendants() and en:GetFullName():find(OBS.bpView:GetFName():ToString(), 1, true) then
+            local i = g:GetIndexForItem(en:GetBindedDataObj()); if i and i >= 0 then OBS.bpIdx = i end
+            break
+          end
+        end
+      end)
+    end
+  end
+  local r = OBS.want or cur
+  local m = 0
+  if r then m = NAV_BITS.trig; if r == "Bottom" then m = m | NAV_BITS.up end end
+  maskSet("obs", m)                   -- also in mouse mode: it only filters gamepad input
+end
+local function taskPadEv() PADEV = navPadEvents() end
+
+-- ---------------------------------------------------------------- 11) battle speed x1 -> x2 -> x3 -> x4 -> x1
+-- The game's speed button only toggles x1 / x2: it sets the persistent level's WorldSettings.TimeDilation to
+-- 1.0 / 2.0 (measured 2026-11-23; nothing else changes) and shows BTN_SpeedUp1 (x1 icon) or BTN_SpeedUp2 (x2).
+-- Each press flips the game's own on/off state; we count the flips: 1 -> 2 -> 3 -> 4 -> 1 (with speed_max = 4
+-- the game is off at x1/x3 and on at x2/x4). Whenever our level differs from what the game would use, we keep
+-- TimeDilation at the level every tick (anything the game re-applies is overwritten next tick) and show a badge.
+-- The press is detected from the icon flip, so mouse, keyboard and gamepad all work. The level is kept for
+-- the next fight. [battle] speed_max = 2..4 (2 = the game's own behaviour). x3/x4 badge: wsmod_speed_<n>.
+-- Reads only widget visibility and one float; no struct/slot reads (those crashed UE4SS, 2026-11-23 12:20).
+local SPD = { view = nil, ws = nil, findAt = 0, active = false, on = nil, level = 1, mem = 1, written = nil, max = 4,
+  overwrites = 0, exports = nil }
+do
+  local e = {}
+  for n = 0, 4 do e[n] = package.loadlib(DLLPATH, "wsmod_speed_" .. n) end
+  if e[0] and e[4] then SPD.exports = e end
+end
+local function spdBadge(n) if SPD.exports then SPD.exports[n]() end end
+local function spdGameOn(v)
+  local b1, b2 = v.BTN_SpeedUp1, v.BTN_SpeedUp2
+  if not (b1 and b1:IsValid() and b2 and b2:IsValid()) then return nil end
+  local v1, v2 = b1:IsVisible(), b2:IsVisible()
+  if v1 == v2 then return nil end
+  return v2
+end
+local function spdFindWS()
+  local pc = FindFirstOf("BP_PlayerController_C"); if not live(pc) then return nil end
+  local lv = pc:GetFullName():match("%.([%w_]+):PersistentLevel"); if not lv then return nil end
+  for _, o in ipairs(FindAllOf("WorldSettings") or {}) do
+    if live(o) then
+      local ok, n = pcall(function() return o:GetOuter():GetOuter():GetFName():ToString() end)
+      if ok and n == lv then return o end
+    end
+  end
+  return nil
+end
+local function spdEnd()
+  if SPD.active then
+    local ws = SPD.ws
+    if SPD.written and ws and ws:IsValid() and math.abs(ws.TimeDilation - SPD.written) < 0.01 then ws.TimeDilation = 1.0 end
+    print(string.format("[GamepadTweaks] speed: fight over at x%d (game re-applied %d times)\n", SPD.level, SPD.overwrites))
+  end
+  SPD.active, SPD.view, SPD.ws, SPD.on, SPD.written = false, nil, nil, nil, nil
+  spdBadge(0)
+end
+local function taskSpeed()
+  if not inFight then if SPD.active or SPD.view then spdEnd() end return end
+  local v = SPD.view
+  if not (v and v:IsValid() and v:IsVisible()) then
+    SPD.view = nil
+    if now() < SPD.findAt then return end
+    SPD.findAt = now() + 0.5
+    for _, x in ipairs(FindAllOf("BPMV_JHBattleModule_C") or {}) do if live(x) and x:IsVisible() then SPD.view = x end end
+    v = SPD.view
+    if not v then return end
+  end
+  local ws = SPD.ws
+  if not (ws and ws:IsValid()) then ws = spdFindWS(); SPD.ws = ws; if not ws then return end end
+  local on = spdGameOn(v); if on == nil then return end
+  if not SPD.active then
+    SPD.active, SPD.on, SPD.overwrites = true, on, 0
+    SPD.max = iniNumber("speed_max", 4); if SPD.max < 2 then SPD.max = 2 elseif SPD.max > 4 then SPD.max = 4 end
+    -- keep the level from the last fight when it fits the game's state, else take the game's
+    local m = SPD.mem
+    if m > SPD.max then m = SPD.max end
+    if ((m % 2 == 0) == on) then SPD.level = m else SPD.level = on and 2 or 1 end
+    print(string.format("[GamepadTweaks] speed: fight start, game %s, level x%d\n", on and "x2" or "x1", SPD.level))
+  elseif on ~= SPD.on then
+    SPD.on = on
+    local nxt = SPD.level % SPD.max + 1                                -- 1 -> 2 -> ... -> max -> 1
+    SPD.level = nxt; SPD.mem = nxt
+    print(string.format("[GamepadTweaks] speed: button -> x%d\n", nxt))
+  end
+  local want, gameVal = SPD.level, on and 2 or 1
+  if want ~= gameVal then                                               -- x3 / x4 (or x1 while the game shows x2 with speed_max = 3)
+    if math.abs(ws.TimeDilation - want) > 0.01 then
+      if SPD.written then SPD.overwrites = SPD.overwrites + 1 end
+      ws.TimeDilation = want; SPD.written = want
+    end
+    spdBadge(want)
+  else
+    SPD.written = nil                                                   -- the game's own value and icon are right
+    spdBadge(0)
+  end
 end
 
 -- ---------------------------------------------------------------- scheduler (100 ms tick)
@@ -978,7 +1239,10 @@ local tasks = {
   { every = 15,  fn = taskBattle },
   { every = 10,  fn = taskBackpack },
   { every = 1,   fn = taskHide },
+  { every = 1,   fn = taskPadEv },
   { every = 1,   fn = taskNav },
+  { every = 1,   fn = taskObs },
+  { every = 1,   fn = taskSpeed },
 }
 local tick = 0
 local errCount = {}

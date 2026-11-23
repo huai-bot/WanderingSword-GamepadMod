@@ -76,6 +76,15 @@
 - 头像栏格子 `BPVE_SideBarCell2_C`（内部按钮 `BTN_SidebarCell`），`:SetFocus()` 可选中指定头像；模块刚拿到焦点后游戏会在约一两帧内再把焦点放回默认头像，需要再设一次。
 - 大地图（行走地图）上 pawn 是 `BP_WorldHero1_C`，模组的 `battle.flag` 此时也是 1；真正战斗是 `BP_FightSpectator_C` 或战斗技能栏可见。
 
+## 观察界面（2026-11-23 实测）
+
+- 界面 `BPMV_Observe_C`（`JHNeoUIObserveView`，VM `JHNeoUIObserveVM`），子模块 key `Property / Equip / Backpack`，`DefaultFocusModuleKey = Property`。视图：`BPMV_Observe_Property_C`、`BPMV_Team_Equip_V3_C`、`BPMV_JHBackpack_Basic_C`（`GRID_ITEM`）。
+- 底部按钮（从左到右）：`BTN_QieCuo` 切磋、`BTN_SongLi` 送礼、`BTN_QingJiao` 请教、`BTN_JiSha`、`BTN_LiDui`（后两个按情况显示）。
+- 原生导航：LT/RT 无作用，LB/RB 切背包分类；背包最左列往左 = `ChangeNaviFocus("Equip", 3)`，**由背包子模块的 VM（`JHBackpackVMBase`）发出**，不是观察 VM；装备往左 = `ChangeNaviFocus("Property", 3)`；属性连按下 5 次到底部按钮，底部按钮往上回属性（控件导航）。
+- `ChangeNaviFocus` 传入界面没有的 key（如 "SideBar"）什么也不做，焦点留在原处，可用来屏蔽某个跳转。
+- 背包「学成」标记 = 格子显示数据 `"is_acquired":true`（秘籍 30–38），全队通用，和 `TeamInfo:HasSkillById` 不同（大多数「学成」书全队都没人会）。
+- 游戏窗口不在前台时（例如 Steam 窗口盖在上面）游戏不处理手柄输入，注入测试前要把游戏切到前台。
+
 ## 物品与装备
 
 - `ItemInfoSpec`：`ItemDefId, Num, Actions[], RandActions[], bOnlyForLayout, GainTime, …`，`GetDef()` 返回 `ItemInfoSetting` 行。

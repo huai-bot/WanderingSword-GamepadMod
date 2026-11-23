@@ -593,6 +593,59 @@ static LRESULT CALLBACK OsdProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, m, wp, lp);
 }
 
+// ============================================================ battle speed badge (x3 / x4)
+// The game only has x1/x2 icons. While Lua runs the battle at x3/x4 it calls wsmod_speed_<n> every tick;
+// we draw a badge in the game's style over the game's own speed icon (top-right of the battle screen).
+// The icon is anchored to the top-right and scales with the window height: measured at 1280x720 the centre
+// is 87 px from the right edge and 85 px from the top, the diamond about 60 px wide.
+static volatile LONG g_spdLevel = 0; static volatile DWORD g_spdTime = 0;
+static HWND g_spdWnd; static HFONT fSpd; static int g_spdFontPx = 0; static LONG g_spdPainted = -1;
+#define SPD_EXPORT(n) extern "C" __declspec(dllexport) int wsmod_speed_##n(void*) { g_spdLevel = n; g_spdTime = GetTickCount(); return 0; }
+SPD_EXPORT(0) SPD_EXPORT(1) SPD_EXPORT(2) SPD_EXPORT(3) SPD_EXPORT(4)
+static LRESULT CALLBACK SpdProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_TIMER: {
+        LONG lv = g_spdLevel;
+        HWND gw = GameWindow();
+        bool show = lv >= 1 && GetTickCount() - g_spdTime < 500 && gw && !g_menuOpen;
+        if (!show) { if (IsWindowVisible(h)) ShowWindow(h, SW_HIDE); return 0; }
+        RECT cr; GetClientRect(gw, &cr); POINT a{ cr.left, cr.top }, b{ cr.right, cr.bottom };
+        ClientToScreen(gw, &a); ClientToScreen(gw, &b);
+        double H = (double)(b.y - a.y); if (H < 100) return 0;
+        int size = (int)(H * 0.092);
+        int cx = b.x - (int)(H * 87.0 / 720.0), cy = a.y + (int)(H * 85.0 / 720.0);
+        int fpx = (int)(size * 0.40);
+        if (fpx != g_spdFontPx) { if (fSpd) DeleteObject(fSpd); fSpd = CreateFontW(-fpx, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Microsoft YaHei"); g_spdFontPx = fpx; g_spdPainted = -1; }
+        SetWindowPos(h, HWND_TOPMOST, cx - size / 2, cy - size / 2, size, size, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (g_spdPainted != lv) { g_spdPainted = lv; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT r; GetClientRect(h, &r); int W = r.right, H = r.bottom;
+        HDC mem = CreateCompatibleDC(dc); HBITMAP bmp = CreateCompatibleBitmap(dc, W, H); HGDIOBJ ob = SelectObject(mem, bmp);
+        Fill(mem, r, RGB(255, 0, 255));                                   // colour key = transparent
+        int c = W / 2, m1 = W / 2 - 2, m2 = W / 2 - 6;
+        POINT outer[4] = { { c, c - m1 }, { c + m1, c }, { c, c + m1 }, { c - m1, c } };
+        POINT inner[4] = { { c, c - m2 }, { c + m2, c }, { c, c + m2 }, { c - m2, c } };
+        HBRUSH bf = CreateSolidBrush(RGB(34, 32, 30)); HPEN pe = CreatePen(PS_SOLID, 2, RGB(214, 208, 196));
+        HGDIOBJ obr = SelectObject(mem, bf), op = SelectObject(mem, pe);
+        Polygon(mem, outer, 4);
+        HPEN pi = CreatePen(PS_SOLID, 1, RGB(120, 114, 104)); SelectObject(mem, pi); SelectObject(mem, GetStockObject(NULL_BRUSH));
+        Polygon(mem, inner, 4);
+        SelectObject(mem, obr); SelectObject(mem, op); DeleteObject(bf); DeleteObject(pe); DeleteObject(pi);
+        SetBkMode(mem, TRANSPARENT);
+        wchar_t t[8]; swprintf_s(t, L"\u00d7%ld", (long)g_spdLevel);
+        Text(mem, t, { 0, 0, W, H }, RGB(240, 236, 228), fSpd, DT_CENTER | DT_VCENTER);
+        BitBlt(dc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem); EndPaint(h, &ps); return 0;
+    }
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
 // keyboard: F opens on the world map; while the panel is open its keys are swallowed so the game does not react
 static HHOOK g_kbHook;
 static LRESULT CALLBACK KbProc(int code, WPARAM wp, LPARAM lp) {
@@ -633,6 +686,10 @@ static DWORD WINAPI MenuThread(LPVOID) {
     g_osdWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
         wo.lpszClassName, L"", WS_POPUP, 0, 0, OW, OH, nullptr, nullptr, g_self, nullptr);
     SetLayeredWindowAttributes(g_osdWnd, 0, 238, LWA_ALPHA); SetTimer(g_osdWnd, 1, 100, nullptr);
+    WNDCLASSW ws{}; ws.lpfnWndProc = SpdProc; ws.hInstance = g_self; ws.lpszClassName = L"WSModSpeed"; RegisterClassW(&ws);
+    g_spdWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+        ws.lpszClassName, L"", WS_POPUP, 0, 0, 60, 60, nullptr, nullptr, g_self, nullptr);
+    SetLayeredWindowAttributes(g_spdWnd, RGB(255, 0, 255), 250, LWA_COLORKEY | LWA_ALPHA); SetTimer(g_spdWnd, 1, 40, nullptr);
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, g_self, 0);
     Log("teleport panel ready (kb hook %s)", g_kbHook ? "ok" : "failed");
     MSG msg; while (GetMessageW(&msg, nullptr, 0, 0) > 0) DispatchMessageW(&msg);

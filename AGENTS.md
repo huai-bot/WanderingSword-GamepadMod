@@ -91,6 +91,9 @@ powershell -File tools\install.ps1
 11. **人物界面切区（`taskNav`，v4.12）**：Lua 每拍通过 `wsmod_nav_*` 导出函数告诉代理 DLL 当前哪些输入会走进属性/装备（任意位置 LT/RT、头像栏右、底部按钮上），代理把这些按键（十字键和左摇杆）藏起来写进 `trig.req`，Lua 再自己跳；背包左边缘靠 `ChangeNaviFocus` 钩子改写目标。300 ms 没刷新掩码代理就恢复放行，Lua 卡住不会锁死手柄。自己调用 `ChangeNaviFocus` 时置 `NAV.self` 以免被钩子改写。只在手柄模式（`IsGamepadMode()`）下工作。
 12. `inBattle`（= `battle.flag`）在大地图上也为真；只在**真正战斗**时停用的功能用 `inFight`。
 
+13. **观察界面（`taskObs`）** 与人物界面共用代理的输入掩码（`maskSet(owner, m)` 合并）和同一份 `trig.req` 事件（`taskPadEv` 每拍读一次，`PADEV`）。改其中一边时不要单独调用 `navMask` / `navPadEvents`。`ChangeNaviFocus` 钩子里先交给 `OBS_HOOK`（观察界面可见时屏蔽所有 Property/Equip 请求），再走人物界面的改写。
+14. 不要在 Lua 探测里读控件的 `Slot`、`Font` 等结构（2026-11-23 12:20 读战斗界面这类属性导致 UE4SS 访问冲突崩溃）；只读类反射、名字、可见性、焦点和简单数值。
+
 ## 4. 用户偏好（务必保持）
 
 - 交流用中文。

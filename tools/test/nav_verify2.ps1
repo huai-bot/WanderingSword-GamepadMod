@@ -55,8 +55,7 @@ Check "LT" "SideBar"
 Check "SR" "Backpack" "stick right"
 O "--- backpack left edge (game's own ChangeNaviFocus, rewritten)"
 Check "SD" "Backpack" "into the grid"
-Check "SR" "Backpack" "col 1"
-Check "SL" "Backpack" "col 0"
+for ($i = 0; $i -lt 6; $i++) { if ((Lua $probe) -match 'idx=(\d+)/' -and ([int]$matches[1] % 6) -eq 0) { break }; Check "SL" "Backpack" "walk to col 0" }
 Check "SL" "SideBar" "stick left at col 0"
 O "--- bottom row"
 Check "RT" "Backpack"; Check "RT" "Bottom"
@@ -72,6 +71,6 @@ Check "SR" "Backpack" ; Check "SR" "Backpack"
 $idx = (Lua $probe)
 Check "LT" $cell "back on the same side bar cell"
 Check "RT" $idx "back on the same backpack cell"
-Check "SL" "Backpack"; Check "SL" "Backpack"
+for ($i = 0; $i -lt 6; $i++) { if ((Lua $probe) -match 'idx=(\d+)/' -and ([int]$matches[1] % 6) -eq 0) { break }; Check "SL" "Backpack" "walk to col 0" }
 Check "SL" $cell "backpack left edge -> same side bar cell"
 Finish
