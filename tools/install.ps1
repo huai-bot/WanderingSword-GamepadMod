@@ -1,9 +1,10 @@
 param(
   [string]$Game = 'D:\GAME\Wandering Sword',
   [string]$Data = 'D:\TOOLS\AWSdata\WanderingSword',
-  [string]$Backup = ''
+  [string]$Backup = '',
+  [switch]$NoBackup
 )
-# Installs build\xinput1_3.dll, the Lua mod and the data files. Backs up what it replaces.
+# Installs build\xinput1_3.dll, the Lua mod and the data files. Backups are on unless explicitly skipped.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $win64 = Join-Path $Game 'Wandering_Sword\Binaries\Win64'
@@ -17,6 +18,7 @@ $stamp = Get-Date -Format yyyyMMdd_HHmmss
 if (-not $Backup) { $Backup = "D:\TOOLS\dshdata\dshbackup\WanderingSword-install_$stamp" }
 $bak = [IO.Path]::GetFullPath($Backup)
 function BackupFile([string]$source, [string]$relative) {
+  if ($NoBackup) { return }
   $dest = Join-Path $bak $relative
   if ((Test-Path -LiteralPath $source) -and -not (Test-Path -LiteralPath $dest)) {
     New-Item -ItemType Directory -Force (Split-Path $dest -Parent) | Out-Null
@@ -58,4 +60,5 @@ BackupFile $places 'data\places.txt'
 Copy-Item (Join-Path $root 'data\places.txt') $places -Force
 if (-not (Test-Path (Join-Path $Data 'wsmod.ini'))) { Copy-Item (Join-Path $root 'data\wsmod.ini') (Join-Path $Data 'wsmod.ini') }
 if (-not (Test-Path (Join-Path $Data 'cursor.png'))) { Write-Warning 'cursor.png missing - run tools\extract_cursor.ps1 (pointer overlay will be invisible without it)' }
-"installed (log windows hidden). backup: $bak"
+if ($NoBackup) { 'installed (log windows hidden). backup skipped by request.' }
+else { "installed (log windows hidden). backup: $bak" }

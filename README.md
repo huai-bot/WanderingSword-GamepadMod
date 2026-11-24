@@ -24,12 +24,15 @@
 - 战斗中自动停用以上全部功能，手柄完全交还游戏
 
 **按键**
-- Start 固定打开人物界面的「队伍」栏目，再按关闭；不再沿用上次的任务、武功或经脉栏目（原为系统菜单）
+- Start 固定打开人物界面的「队伍」栏目，再按关闭；不再沿用上次的任务、武学或经脉栏目（原为系统菜单）
 - 交互判定半径从 35 扩大到 90（可配置）
+
+**自动存档**
+- 每 120 秒请求一次游戏原有自动存档，按现实时间计时；战斗、对话、菜单、加载或角色未落地时延后，恢复安全后再存
 
 **世界地图**
 - 地图打开时右摇杆交还游戏（原生拖拽、缩放）
-- 手柄 `Y` / 键盘 `F` 打开驿路传送面板：按 中原/西域/关外/南疆/北地/海外 分页，只列出到访过的地点，有驿站的城镇落点在驿站
+- 手柄 `Y` / 键盘 `F` 打开驿路传送面板：按 中原/西域/关外/南疆/北地/海外 分页，地点按拼音字母排序；未到访的地点显示为灰色「未解锁」，不能传送，有驿站的城镇落点在驿站
 - 面板操作：摇杆/十字键选择，LB/RB 或 Q/E 切换区域，A/回车/鼠标点击传送，B/Esc 关闭
 
 **人物界面背包**
@@ -47,7 +50,7 @@
 1. 安装 UE4SS v4.0.0 到 `<游戏>\Wandering_Sword\Binaries\Win64\`（`dwmapi.dll` + `ue4ss\`）
 2. 编译原生部分：`tools\build.bat`（生成 `build\xinput1_3.dll`）
 3. 首次需要提取游戏指针图标：`powershell -File tools\extract_cursor.ps1`（游戏资源不随仓库分发）
-4. 正常退出游戏后安装：`powershell -File tools\install.ps1`（备份放在 `D:\TOOLS\dshdata\dshbackup\WanderingSword-install_<时间>\`，保留目录结构；可用 `-Backup` 指定已有备份目录）
+4. 正常退出游戏后安装：`powershell -File tools\install.ps1`（备份放在 `D:\TOOLS\dshdata\dshbackup\WanderingSword-install_<时间>\`，保留目录结构；可用 `-Backup` 指定已有备份目录，明确不需要备份时用 `-NoBackup`）
 5. 启动游戏。安装时默认关闭两个 UE4SS 日志窗口，但仍写日志：[UE4SS.log](<D:/GAME/Wandering Sword/Wandering_Sword/Binaries/Win64/ue4ss/UE4SS.log>) 中出现 `[GamepadTweaks] v4.x loaded`，[wsmod.log](<D:/TOOLS/AWSdata/WanderingSword/wsmod.log>) 中出现 `wsmod loaded` 即成功
 
 卸载：删除 `Win64\xinput1_3.dll`，并在 `ue4ss\Mods\mods.txt` 里把 `GamepadTweaks` 改为 `0`。

@@ -50,7 +50,7 @@ powershell -File tools\install.ps1
 ```
 
 - DLL 改完必须重启游戏；Lua 改完可在游戏里按 `Ctrl+R` 热重载（UE4SS 设置里已开 `EnableHotReloadSystem`），但修改调度循环后建议重启。
-- 必须正常退出游戏后安装；install.ps1 会拒绝向运行中的游戏安装。备份统一放在 `D:\TOOLS\dshdata\dshbackup\WanderingSword-install_<时间>\`，保留 game/data 目录结构；`-Backup` 可复用任务已有备份，不覆盖原始备份。
+- 必须正常退出游戏后安装；install.ps1 会拒绝向运行中的游戏安装。备份统一放在 `D:\TOOLS\dshdata\dshbackup\WanderingSword-install_<时间>\`，保留 game/data 目录结构；`-Backup` 可复用任务已有备份，不覆盖原始备份。用户明确要求不额外备份时可用 `-NoBackup`。
 - 安装时把 UE4SS `[Debug]` 的 `ConsoleEnabled` / `GuiConsoleEnabled` / `GuiConsoleVisible` 设为 0，只隐藏窗口，文件日志仍保留。
 - 编译后确认新 DLL 里真的包含你的改动（例如搜索新加的日志字符串），曾经出现过两次编辑互相覆盖、编出来的是旧代码。
 
@@ -104,7 +104,7 @@ powershell -File tools\install.ps1
 14. 不要在 Lua 探测里读控件的 `Slot`、`Font` 等结构（2026-11-23 12:20 读战斗界面这类属性导致 UE4SS 访问冲突崩溃）；只读类反射、名字、可见性、焦点和简单数值。
 
 15. **速战（`taskSpeed`）**：倍率要每拍重写（游戏会改回去），战斗界面隐藏时（技能特写）也要继续维持；自动战斗只在「是模组打开的」（`quick_auto.flag`）时才替用户关掉。Lua 里别写 `a and f() or nil` 取布尔返回值（false 会变 nil，v4.15 初版因此在 1 倍时不工作）。
-16. 加速循环由 `/Script/JH.JHNeoUIBattleModuleView:HandleBtn_SpeedUp_1/2` 的钩子累计按键，不能根据图标刷新猜输入。`SPD.correcting` 屏蔽自己修正图标产生的事件；开场按键应保留到战斗界面就绪。
+16. 鼠标加速走 `/Script/JH.JHNeoUIBattleModuleView:HandleBtn_SpeedUp_1/2` 钩子；手柄 Y 单键由代理拦截，写入共享 `trig.req`，`taskSpeed` 从 `PADEV` 累计 `Y`。`wsmod_speed_input_0/1` 只在真正战斗中启用，500 ms 无更新就放行原生 Y；LB/RB/LT/RT 与 Y 的组合保持原生。不能根据图标刷新猜输入；`SPD.correcting` 屏蔽自己修正图标的事件，开场按键保留到战斗界面就绪。
 17. `wsmod_mute_0/1` 只控制当前游戏进程的 Windows 音频会话，COM 操作在独立线程；保留原静音状态、不改音量。静音与遮罩独立，500 ms 没收到 Lua 更新就恢复；不要在 DllMain 里调用 COM。
 
 ## 4. 用户偏好（务必保持）

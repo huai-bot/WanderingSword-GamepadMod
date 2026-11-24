@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.21 loaded\n")
+print("[GamepadTweaks] v4.22 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -55,8 +55,8 @@ end
 -- game to keyboard/mouse mode (log: "键鼠模式 : --- show cursor"), which hides the gamepad focus frame until the
 -- stick is moved. Closing with B left the game in keyboard mode for the next opening too.
 -- Now the proxy writes start.req and waits up to 0.6 s for start.ack:
---   "1" = done here without any input event: JHNeoUIPrimeModuleVM:ShowAndGotoTab(1) / :Hide() (the game stays
---         in its input mode; every opening selects 队伍 instead of remembering 任务 / 武功 / 经脉)
+--   "1" = done here without any input event: JHNeoUIPrimeModuleVM:ShowAndGotoTab(0) / :Hide() (the game stays
+--         in its input mode; tabs are zero-based: 0 队伍, 1 武学, 2 任务, 3 经脉)
 --   "0" = not possible here (fight, dialog, no HUD = cut-scene / loading, ...): the proxy taps B as before.
 -- v4.17 "clicked" the HUD's 人物 button instead: that event does not open the screen (measured 2026-11-24).
 local START = { pending = nil, at = 0 }
@@ -137,7 +137,7 @@ local function taskStart()
     else
       local free, why = hudFree()
       if not free then writeFile("start.ack", "0") print("[GamepadTweaks] Start: " .. why .. ", proxy taps B\n") return end
-      local ok, accepted = pcall(function() return vm:ShowAndGotoTab(1) end)
+      local ok, accepted = pcall(function() return vm:ShowAndGotoTab(0) end)
       if not ok or not accepted then writeFile("start.ack", "0") return end
       P.pending, P.at, P.vm = "open", now(), vm
     end
@@ -145,8 +145,14 @@ local function taskStart()
   local shown = primeShown(P.vm)
   local done = (P.pending == "open") == shown
   if done and P.pending == "open" then
-    local ok, tab = pcall(function() return P.vm:CurrentTabIndex() end)
-    done = ok and tab == 1
+    local ok, ready = pcall(function()
+      if P.vm:CurrentTabIndex() ~= 0 then return false end
+      for _, b in ipairs(FindAllOf("JHMainCharacterBackpackInTeamVM") or {}) do
+        if live(b) and b:GetModuleVisibility() then return true end
+      end
+      return false
+    end)
+    done = ok and ready
   end
   if done then
     if P.pending == "open" then P.openedAt = now() end
@@ -396,6 +402,33 @@ local function taskBattle()
     print(string.format("[GamepadTweaks] battle=%s (spellbar=%s pawn=%s %s)\n", tostring(b), tostring(sigSpell), tostring(sigPawn), full:match("[^%.]+$") or "?"))
   end
 end
+
+-- ---------------------------------------------------------------- 8b) periodic autosave (real seconds, never forced)
+-- Keep the game's AutoSave path: its SaveSlot implementation still decides whether saving is allowed.
+-- If the interval expires in battle, a dialog, a menu or a loading screen, retry when the field is safe.
+local AUTOSAVE_INTERVAL = 120
+local AUTOSAVE = { nextAt = nil }
+local function taskAutoSave()
+  local pc, pawn, lv, full = stableWorld(); if not pc then return end
+  if not (full:find("BP_SceneHero", 1, true) or full:find("BP_WorldHero", 1, true)) then return end
+  local t = os.time()          -- wall clock: battle speed and paused game time cannot shorten the interval
+  if not AUTOSAVE.nextAt then AUTOSAVE.nextAt = t + AUTOSAVE_INTERVAL end
+  if t < AUTOSAVE.nextAt then return end
+  if inFight or not onGround(pawn) or primeShown() or fieldMenu() then return end
+  if widgetShown("BPMV_BattleSpell_C") or not widgetShown("BPVE_HUD_NaviBtn_C") then return end
+  local ui = getUI(); if not ui or ui:ShouldDisableInput() then return end
+  local dialog = ui:GetDialogView()
+  if dialog and dialog:IsValid() and dialog:IsVisible() then return end
+  for _, sm in ipairs(FindAllOf("SaveManager") or {}) do
+    if live(sm) then
+      sm:AutoSave()
+      AUTOSAVE.nextAt = t + AUTOSAVE_INTERVAL
+      print("[GamepadTweaks] autosave: requested (120 s interval)\n")
+      return
+    end
+  end
+end
+
 -- ---------------------------------------------------------------- 9) character-screen backpack
 -- * on open: switch to the configured sort type (default 4 = 类型) or press 整理
 -- * hide equipment the focused character cannot use (Requirements: OnlyHero / ExcludeNPC / OnlyDesignatedNPC)
@@ -983,7 +1016,7 @@ do
 end
 local NAV_BITS = { up = 1, down = 2, left = 4, right = 8, trig = 16 }
 local MASKS = { prime = 0, obs = 0 }
-local PADEV = nil        -- proxy events ("L" "R" "<" ">" "^" "v") of this tick, read once by taskPadEv
+local PADEV = nil        -- proxy events ("L" "R" "<" ">" "^" "v" "Y") of this tick, read once by taskPadEv
 local navMask
 local function maskSet(owner, m) MASKS[owner] = m; navMask(MASKS.prime | MASKS.obs) end
 function navMask(m)
@@ -1262,7 +1295,7 @@ local function taskPadEv() PADEV = navPadEvents() end
 -- 速战 (quick battle): the game's own auto battle (view:EnableAutoBattle) + TimeDilation held at quick_speed
 -- (default 50; MaxGlobalTimeDilation raised for it). The fight is still played out by the game - win or lose -,
 -- only compressed: 1v1 sparring took 6-10 s at x2 and 0.6-2.3 s at x20/x50/x100 (9 fights, no stalls).
--- Cycle by hooks on the actual speed-button handlers (mouse / keyboard / gamepad), not icon changes:
+-- Mouse speed-button hooks and the proxy's single-Y events advance the same cycle, not icon changes:
 -- x1 -> x2 -> 速战 -> x1. The game restores its icon during fight startup and cut-ins; that is not a press.
 -- Our own icon corrections are guarded so they cannot advance the cycle. Early presses are queued until the
 -- battle view is ready. Auto battle is switched off again only if we switched it on. The level is kept for
@@ -1273,7 +1306,7 @@ local function taskPadEv() PADEV = navPadEvents() end
 local SPD_Q = 3
 local SPD = { view = nil, ws = nil, findAt = 0, active = false, on = nil, level = 1, mem = 1, written = nil,
   overwrites = 0, exports = nil, quick = true, qspeed = 50, qtimeout = 90, qStart = nil, qClock = nil, autoByUs = false, mask = true,
-  mute = true, correcting = false, presses = 0, hooks = {}, hookAt = 0, maxOrig = nil, over = false, resAt = 0 }
+  mute = true, correcting = false, presses = 0, padPresses = 0, hooks = {}, hookAt = 0, maxOrig = nil, over = false, resAt = 0 }
 do                                                                     -- level kept across mod / game restarts
   local m = tonumber((readFirst("speed_level.txt") or ""):match("%d") or "")
   if m and m >= 1 and m <= 3 then SPD.mem = m end
@@ -1285,6 +1318,13 @@ do
   if e[0] then SPD.exports = e end
   SPD.muteOff = package.loadlib(DLLPATH, "wsmod_mute_0")
   SPD.muteOn = package.loadlib(DLLPATH, "wsmod_mute_1")
+  SPD.padOff = package.loadlib(DLLPATH, "wsmod_speed_input_0")
+  SPD.padOn = package.loadlib(DLLPATH, "wsmod_speed_input_1")
+  print("[GamepadTweaks] speed: gamepad input bridge " .. (SPD.padOn and SPD.padOff and "available" or "missing (old xinput1_3.dll)") .. "\n")
+end
+local function spdPadInput(on)
+  if on then if SPD.padOn then SPD.padOn() end
+  elseif SPD.padOff then SPD.padOff() end
 end
 local function spdBadge(n) if SPD.exports and SPD.exports[n] then SPD.exports[n]() end end
 local function spdMute(on)
@@ -1313,6 +1353,12 @@ local function spdFightPawn()
   local pawn = pc.Pawn; if not live(pawn) then return false end
   return pawn:GetFullName():find("BP_FightSpectator") ~= nil
 end
+local function spdQueuePress(v)
+  if not live(v) or not spdFightPawn() then return end
+  local a = v:GetAddress()
+  if SPD.pressView ~= a then SPD.pressView, SPD.presses = a, 0 end
+  SPD.presses = SPD.presses + 1
+end
 local function spdInstallHooks()
   if SPD.hooks[1] and SPD.hooks[2] then return end
   if now() < SPD.hookAt then return end
@@ -1326,11 +1372,7 @@ local function spdInstallHooks()
           RegisterHook(path, function(self)
             if SPD.correcting or SPD.over then return end
             local good, e = pcall(function()
-              local v = self:get()
-              if not live(v) or not spdFightPawn() then return end
-              local a = v:GetAddress()
-              if SPD.pressView ~= a then SPD.pressView, SPD.presses = a, 0 end
-              SPD.presses = SPD.presses + 1
+              spdQueuePress(self:get())
             end)
             if not good then print("[GamepadTweaks] speed: button hook error: " .. tostring(e) .. "\n") end
           end)
@@ -1372,6 +1414,7 @@ local function spdAuto(v, on)
 end
 local function spdName(l) return l == SPD_Q and "速战" or ("x" .. l) end
 local function spdEnd()
+  spdPadInput(false)
   spdMute(false)
   if SPD.active then
     if SPD.view and SPD.view:IsValid() then spdAuto(SPD.view, false) end
@@ -1385,7 +1428,7 @@ local function spdEnd()
       dur and string.format(", 速战 %d s", dur) or "", SPD.overwrites))
   end
   SPD.active, SPD.view, SPD.ws, SPD.on, SPD.written, SPD.qStart, SPD.maxOrig = false, nil, nil, nil, nil, nil, nil
-  SPD.over, SPD.qClock, SPD.seen, SPD.pressView, SPD.presses = false, nil, nil, nil, 0
+  SPD.over, SPD.qClock, SPD.seen, SPD.pressView, SPD.presses, SPD.padPresses = false, nil, nil, nil, 0, 0
   SPD.findAt = 0
   spdBadge(0)
 end
@@ -1398,10 +1441,17 @@ local function spdResult()
 end
 local function taskSpeed()
   spdInstallHooks()
+  -- Arm the proxy from the real pawn, not battle.flag (also true on the overworld).
+  -- PADEV is read once by taskPadEv; do not consume the navigation event file a second time.
+  local fight = spdFightPawn()
+  if fight and not SPD.over then
+    spdPadInput(true)
+    if PADEV then local _, n = PADEV:gsub("Y", ""); SPD.padPresses = SPD.padPresses + n end
+  else spdPadInput(false); SPD.padPresses = 0 end
   -- taskBattle runs every 300 ms. A real button press can arrive before that poll sees the new fight.
   if not inFight then
-    if SPD.presses > 0 and spdFightPawn() then inFight = true
-    else if SPD.active or SPD.view or SPD.presses > 0 then spdEnd() end return end
+    if fight then inFight = true
+    else if SPD.active or SPD.view or SPD.presses > 0 or SPD.padPresses > 0 then spdEnd() end return end
   end
   if SPD.over then return end
   -- the battle HUD is hidden during skill cut-ins: keep the view once found and keep holding the speed meanwhile
@@ -1425,7 +1475,8 @@ local function taskSpeed()
     SPD.resAt = now()
     local r = spdResult()
     if r then
-      SPD.over, SPD.presses = true, 0
+      SPD.over, SPD.presses, SPD.padPresses = true, 0, 0
+      spdPadInput(false)
       spdMute(false)
       spdAuto(v, false)
       ws.TimeDilation = 1.0
@@ -1451,7 +1502,7 @@ local function taskSpeed()
   if not SPD.active then
     if not hudUp then return end
     SPD.seen = SPD.seen or now()
-    if SPD.presses == 0 and now() - SPD.seen < 0.3 then return end    -- pending presses never get discarded
+    if SPD.presses == 0 and SPD.padPresses == 0 and now() - SPD.seen < 0.3 then return end    -- pending presses never get discarded
     SPD.active, SPD.on, SPD.overwrites = true, on, 0
     SPD.quick = iniNumber("quick_battle", 1) == 1
     SPD.qspeed = iniNumber("quick_speed", 50); if SPD.qspeed < 3 then SPD.qspeed = 3 elseif SPD.qspeed > 200 then SPD.qspeed = 200 end
@@ -1462,7 +1513,7 @@ local function taskSpeed()
     if m == SPD_Q and not SPD.quick then m = 1 end
     -- 速战 is kept whatever the game's own switch says (v4.15-4.19 dropped it when the game started at x2, e.g.
     -- after a fight left at x2: "fight start, game x2, level x2"); x1 / x2 follow the game's switch
-    if m == SPD_Q or SPD.presses > 0 then SPD.level = m
+    if m == SPD_Q or SPD.presses > 0 or SPD.padPresses > 0 then SPD.level = m
     else SPD.level = on and 2 or 1 end
     if SPD.level ~= SPD_Q and SPD.autoByUs then spdAuto(v, false) end
     print(string.format("[GamepadTweaks] speed: fight start, game %s, level %s\n", on and "x2" or "x1", spdName(SPD.level)))
@@ -1470,6 +1521,8 @@ local function taskSpeed()
   local presses = SPD.presses
   SPD.presses = 0
   if SPD.pressView and SPD.pressView ~= v:GetAddress() then presses = 0 end
+  presses = presses + SPD.padPresses
+  SPD.padPresses = 0
   for _ = 1, presses do
     local nxt
     if SPD.level == 1 then nxt = 2
@@ -1538,6 +1591,7 @@ local tasks = {
   { every = 1,   fn = taskNav },
   { every = 1,   fn = taskObs },
   { every = 1,   fn = taskSpeed },
+  { every = 50,  fn = taskAutoSave },
 }
 local tick = 0
 local errCount = {}

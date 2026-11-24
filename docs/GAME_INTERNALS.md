@@ -23,7 +23,7 @@
 - 当前关卡：pawn 全名里 `.<关卡>:PersistentLevel`，例如 `LV_25_P`。
 - 交互检测：`BP_SceneHero` 里名为 `Sphere` 的 `SphereComponent`，资源默认半径 35（运行时读到 32），重叠事件 `HandleSphereBeginOverlap/EndOverlap`。改 `SetSphereRadius` 即可扩大范围，每次切图都会重建，需要重新设置。
 - `JHNeoUISubsystem`：`GotoDefaultStatus()`、`ShouldDisableInput()`、`GetDialogView()`、`CommonHandleGlobalNaviBtnClick(i)`、`OpenWorldMap()`、`OpenCourierStation(id)` 等。**不要在世界未就绪时调用**。
-- `SaveManager`（`BP_GameInstance_C` 子对象）：`LoadSlot(i)`、`SaveSlot(i, bAuto, name)`、`AutoSave()`。
+- `SaveManager`（`BP_GameInstance_C` 子对象）：`LoadSlot(i)`、`SaveSlot(i, bAuto, name)`、`AutoSave()`。模组每 120 秒调用原有 `AutoSave()`，沿用游戏的存档检查；定时任务在现有游戏线程循环里每秒检查一次，用 `os.time()` 按现实时间计时，战斗、对话、菜单、加载或未落地时延后。
 
 ## 地图与传送
 
@@ -42,7 +42,7 @@
 
 ## 人物界面与背包
 
-- 打开人物界面：`JHNeoUIPrimeModuleVM:Show()` 会保留上次的栏目；Start 必须用 `ShowAndGotoTab(1)` 明确打开队伍，关闭用 `Hide()`，用 `CurrentTabIndex()` 校验。栏目编号：1 队伍、2 武功、3 任务、4 经脉。界面 `BPMV_Prime_C` → `BPMV_PrimeTeam_C` → `BPMV_PrimeTeamBackpack_C`。
+- 打开人物界面：`JHNeoUIPrimeModuleVM:Show()` 会保留上次的栏目；Start 用 `ShowAndGotoTab(0)` 明确打开队伍，关闭用 `Hide()`。栏目编号从 0 开始：0 队伍、1 武学、2 任务、3 经脉；用 `CurrentTabIndex() == 0` 和背包 VM 的 `GetModuleVisibility()` 一起确认打开成功。界面 `BPMV_Prime_C` → `BPMV_PrimeTeam_C` → `BPMV_PrimeTeamBackpack_C`。
 - 主角背包 VM：`JHMainCharacterBackpackInTeamVM`（父类 `JHNeoUIItemModuleVM_WDT`）
   - `GetModuleVisibility()` 判断是否打开
   - `GetPairView()` → `BPMV_JHBackpack_Basic_C`
@@ -80,7 +80,7 @@
 
 - 游戏的加速按钮只切换 1/2 倍：改当前持久关卡 `WorldSettings.TimeDilation`（1.0/2.0），`MaxGlobalTimeDilation` 默认 20。界面 `BPMV_JHBattleModule_C`：`BTN_SpeedUp1`（显示 ×1 图标）/`BTN_SpeedUp2`（×2），`HandleBtn_SpeedUp_1()` 由 1 倍切到 2 倍，`HandleBtn_SpeedUp_2()` 由 2 倍切到 1 倍。游戏记住这个开关。
 - 战斗中游戏会反复把 `TimeDilation` 设回自己的值（一场几十次），要每帧重新写。技能特写时战斗界面整个隐藏。
-- 加速事件的原生反射路径：`/Script/JH.JHNeoUIBattleModuleView:HandleBtn_SpeedUp_1` / `HandleBtn_SpeedUp_2`；`BtnSpeedUpFlagIs1()` 返回持久开关（true = 1 倍）。开场或技能特写会刷新图标，不能据此判断用户按键；模组主动调用两个处理函数时必须加重入保护。
+- 鼠标加速事件的原生反射路径：`/Script/JH.JHNeoUIBattleModuleView:HandleBtn_SpeedUp_1` / `HandleBtn_SpeedUp_2`。本游戏版本没有战斗蓝图 `HandleBtn_SpeedUp`，手柄快捷键不经过这两个鼠标处理函数；模组通过代理接收 Y 单键并写入共享 `trig.req`，LB/RB/LT/RT 与 Y 的组合仍走原生逻辑。`BtnSpeedUpFlagIs1()` 返回持久开关（true = 1 倍）。开场或技能特写会刷新图标，不能据此判断用户按键；模组主动调用两个原生处理函数时必须加重入保护。
 - 自动战斗：`EnableAutoBattle()` / `DisableAutoBattle()` / `BtnAutoBattleFlagIsAuto()`（都在战斗界面上），游戏记住这个开关（跨战斗、跨重启）。
 - 上一场的 `BPMV_JHBattleModule_C` 实例可能还在，要取**可见**的那个。
 - 结算：胜利 `BPMV_BattleWinMaster_C`（VM `JHNeoUIBattleResultVM:HandleModuleClose()` 关闭），失败 `BPMV_BattleFailure_C`（按钮事件 `BndEvt__BPMV_BattleFailure_NeoUIButtonBase_76_..._OnButtonClickedEvent__DelegateSignature`）。

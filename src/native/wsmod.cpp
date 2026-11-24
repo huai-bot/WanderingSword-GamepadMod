@@ -18,6 +18,7 @@
 #include <cwchar>
 #include <vector>
 #include <string>
+#include <algorithm>
 
 #define DATA_DIR L"D:\\TOOLS\\AWSdata\\WanderingSword\\"
 
@@ -155,8 +156,15 @@ static volatile LONG g_fight = 0;     // a real fight (fight.flag): Start stays 
 // trig.req ("L"/"R" = LT/RT, "<" ">" "^" "v" = d-pad or left stick), Lua then jumps itself -> no flash.
 enum { NAV_UP = 1, NAV_DOWN = 2, NAV_LEFT = 4, NAV_RIGHT = 8, NAV_TRIG = 16 };
 static volatile LONG g_navMask = 0, g_navStage = 0; static volatile DWORD g_navTime = 0;
-static volatile LONG g_ev[6];          // L R < > ^ v
-static const char EV_CH[6] = { 'L', 'R', '<', '>', '^', 'v' };
+static volatile LONG g_ev[7];          // L R < > ^ v Y (battle speed)
+static const char EV_CH[7] = { 'L', 'R', '<', '>', '^', 'v', 'Y' };
+// Lua arms the single-Y shortcut only while a real fight is active. A stopped loop restores native input.
+static volatile LONG g_speedInput = 0, g_speedInputTick = 0;
+extern "C" __declspec(dllexport) int wsmod_speed_input_0(void*) { InterlockedExchange(&g_speedInput, 0); return 0; }
+extern "C" __declspec(dllexport) int wsmod_speed_input_1(void*) {
+    InterlockedExchange(&g_speedInputTick, (LONG)GetTickCount());
+    InterlockedExchange(&g_speedInput, 1); return 0;
+}
 static LONG NavMask() { return (GetTickCount() - g_navTime < 300) ? g_navMask : 0; }   // stale -> nothing blocked
 extern "C" __declspec(dllexport) int wsmod_nav_begin(void*) { g_navStage = 0; return 0; }
 extern "C" __declspec(dllexport) int wsmod_nav_up(void*) { g_navStage |= NAV_UP; return 0; }
@@ -389,11 +397,11 @@ static DWORD WINAPI MouseThread(LPVOID) {
     for (;;) {
         Sleep(8);
         DWORD now = GetTickCount(); double dt = (now - last) / 1000.0; last = now; if (dt > 0.05) dt = 0.05;
-        { LONG any = 0, n[6];
-          for (int k = 0; k < 6; k++) { n[k] = InterlockedExchange(&g_ev[k], 0); any |= n[k]; }
+        { LONG any = 0, n[7];
+          for (int k = 0; k < 7; k++) { n[k] = InterlockedExchange(&g_ev[k], 0); any |= n[k]; }
           if (any) {
             FILE* tf = nullptr;
-            if (_wfopen_s(&tf, DATA_DIR L"trig.req", L"ab") == 0 && tf) { for (int k = 0; k < 6; k++) for (LONG i = 0; i < n[k]; i++) fputc(EV_CH[k], tf); fclose(tf); }
+            if (_wfopen_s(&tf, DATA_DIR L"trig.req", L"ab") == 0 && tf) { for (int k = 0; k < 7; k++) for (LONG i = 0; i < n[k]; i++) fputc(EV_CH[k], tf); fclose(tf); }
           } }
         if ((++n % 25) == 0) {
             std::wstring s = ReadSmallFile(L"map.flag");
@@ -455,8 +463,8 @@ struct Place {
 };
 static const wchar_t* REGIONS[6] = { L"中原", L"西域", L"关外", L"南疆", L"北地", L"海外" };
 static std::vector<Place> g_all;
-static std::vector<int> g_list[6];     // visited places per region (indices into g_all)
-static int g_total[6];
+static std::vector<int> g_list[6];     // all places per region (indices into g_all), including locked ones
+static int g_total[6], g_visited[6];
 static std::wstring g_curLv;
 
 static std::vector<std::wstring> Split(const std::wstring& s, wchar_t d) {
@@ -484,7 +492,7 @@ static void LoadPlaces() {
         V v{ c[0], _wtof(c[1].c_str()), _wtof(c[2].c_str()), _wtof(c[3].c_str()) }; vis.push_back(v);
     }
     g_curLv = ReadSmallFile(L"cur.txt"); while (!g_curLv.empty() && iswspace(g_curLv.back())) g_curLv.pop_back();
-    for (int r = 0; r < 6; r++) { g_list[r].clear(); g_total[r] = 0; }
+    for (int r = 0; r < 6; r++) { g_list[r].clear(); g_total[r] = g_visited[r] = 0; }
     for (int i = 0; i < (int)g_all.size(); i++) {
         Place& p = g_all[i]; p.visited = false; p.current = false;
         for (auto& lv : p.levels) if (lv == g_curLv) p.current = true;
@@ -495,8 +503,15 @@ static void LoadPlaces() {
             if (stVisited) { p.tLv = p.stLv; p.tx = p.sx; p.ty = p.sy; p.tz = p.sz; }
             else { p.tLv = first->lv; p.tx = first->x; p.ty = first->y; p.tz = first->z; }
         }
-        for (int r = 0; r < 6; r++) if (p.region == REGIONS[r]) { g_total[r]++; if (p.visited) g_list[r].push_back(i); }
+        for (int r = 0; r < 6; r++) if (p.region == REGIONS[r]) {
+            g_list[r].push_back(i); g_total[r]++; if (p.visited) g_visited[r]++;
+        }
     }
+    for (auto& list : g_list) std::stable_sort(list.begin(), list.end(), [](int a, int b) {
+        const auto& x = g_all[a].name; const auto& y = g_all[b].name;
+        int order = CompareStringEx(L"zh-CN", SORT_STRINGSORT, x.c_str(), (int)x.size(), y.c_str(), (int)y.size(), nullptr, nullptr, 0);
+        return order ? order == CSTR_LESS_THAN : x < y;
+    });
 }
 static int RegionOfCurrent() {
     for (auto& p : g_all) if (p.current) for (int r = 0; r < 6; r++) if (p.region == REGIONS[r]) return r;
@@ -528,16 +543,16 @@ static void DrawPanel(HDC dc) {
     const COLORREF BG = RGB(24, 21, 18), GOLD = RGB(206, 170, 98), INK = RGB(236, 226, 204), DIM = RGB(130, 120, 104);
     RECT all{ 0, 0, PW, PH }; Fill(dc, all, BG); Frame(dc, { 1, 1, PW - 1, PH - 1 }, GOLD, 2); Frame(dc, { 7, 7, PW - 7, PH - 7 }, RGB(90, 74, 46), 1);
     SetBkMode(dc, TRANSPARENT);
-    Text(dc, L"驿路传送 · 已到访之地", { GX, 18, PW / 2 + 100, 60 }, GOLD, fTitle, DT_LEFT | DT_VCENTER);
-    int visitedAll = 0, totalAll = 0; for (int r = 0; r < 6; r++) { visitedAll += (int)g_list[r].size(); totalAll += g_total[r]; }
+    Text(dc, L"驿路传送 · 地点一览", { GX, 18, PW / 2 + 100, 60 }, GOLD, fTitle, DT_LEFT | DT_VCENTER);
+    int visitedAll = 0, totalAll = 0; for (int r = 0; r < 6; r++) { visitedAll += g_visited[r]; totalAll += g_total[r]; }
     wchar_t buf[96]; swprintf_s(buf, L"已到访 %d / %d", visitedAll, totalAll);
     Text(dc, buf, { PW / 2, 18, PW - GX, 60 }, DIM, fHint, DT_RIGHT | DT_VCENTER);
     for (int i = 0; i < 6; i++) {
         RECT r = TabRect(i); bool on = i == g_tab;
         Fill(dc, r, on ? GOLD : (i == g_hoverTab ? RGB(56, 48, 36) : RGB(38, 33, 27)));
         if (!on) Frame(dc, r, RGB(90, 74, 46), 1);
-        swprintf_s(buf, L"%s  %d/%d", REGIONS[i], (int)g_list[i].size(), g_total[i]);
-        Text(dc, buf, r, on ? RGB(24, 18, 8) : (g_list[i].empty() ? DIM : INK), fTab, DT_CENTER | DT_VCENTER);
+        swprintf_s(buf, L"%s  %d/%d", REGIONS[i], g_visited[i], g_total[i]);
+        Text(dc, buf, r, on ? RGB(24, 18, 8) : (g_visited[i] == 0 ? DIM : INK), fTab, DT_CENTER | DT_VCENTER);
     }
     Text(dc, L"LB", { GX - 26, TABY, GX - 2, TABY + TABH }, DIM, fHint, DT_CENTER | DT_VCENTER);
     Text(dc, L"RB", { TabRect(5).right + 2, TABY, TabRect(5).right + 30, TABY + TABH }, DIM, fHint, DT_CENTER | DT_VCENTER);
@@ -546,13 +561,17 @@ static void DrawPanel(HDC dc) {
     for (int v = 0; v < ROWS * COLS; v++) {
         int i = g_top * COLS + v; if (i >= n) break;
         Place& p = g_all[L[i]]; RECT r = CellRect(v); bool sel = i == g_sel;
-        Fill(dc, r, sel ? GOLD : RGB(40, 35, 29));
-        Frame(dc, r, sel ? RGB(250, 220, 150) : RGB(84, 70, 46), sel ? 2 : 1);
+        bool locked = !p.visited, selected = sel && !locked;
+        Fill(dc, r, selected ? GOLD : (locked ? RGB(29, 27, 25) : RGB(40, 35, 29)));
+        Frame(dc, r, sel ? (locked ? DIM : RGB(250, 220, 150)) : RGB(84, 70, 46), sel ? 2 : 1);
         RECT tr = r; tr.left += 16; tr.right -= 10;
-        COLORREF tc = sel ? RGB(24, 18, 8) : (p.current ? DIM : INK);
-        Text(dc, p.name, tr, tc, fCell, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
-        if (p.current) Text(dc, L"当前", tr, sel ? RGB(60, 44, 20) : GOLD, fHint, DT_RIGHT | DT_VCENTER);
-        else if (p.hasSt && p.tLv == p.stLv) Text(dc, L"驿站", tr, sel ? RGB(60, 44, 20) : DIM, fHint, DT_RIGHT | DT_VCENTER);
+        RECT nameRect = tr;
+        if (locked || p.current || (p.hasSt && p.tLv == p.stLv)) nameRect.right -= locked ? 62 : 42;
+        COLORREF tc = locked ? RGB(105, 100, 94) : (selected ? RGB(24, 18, 8) : (p.current ? DIM : INK));
+        Text(dc, p.name, nameRect, tc, fCell, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        if (locked) Text(dc, L"未解锁", tr, DIM, fHint, DT_RIGHT | DT_VCENTER);
+        else if (p.current) Text(dc, L"当前", tr, selected ? RGB(60, 44, 20) : GOLD, fHint, DT_RIGHT | DT_VCENTER);
+        else if (p.hasSt && p.tLv == p.stLv) Text(dc, L"驿站", tr, selected ? RGB(60, 44, 20) : DIM, fHint, DT_RIGHT | DT_VCENTER);
     }
     int rowsTotal = (n + COLS - 1) / COLS;
     if (rowsTotal > ROWS) {
@@ -573,6 +592,7 @@ static void Reposition(HWND h) {
 static void DoTeleport() {
     auto& L = g_list[g_tab]; if (g_sel < 0 || g_sel >= (int)L.size()) return;
     Place& p = g_all[L[g_sel]];
+    if (!p.visited) { Toast(L"此地点尚未解锁，到访后才能传送"); InvalidateRect(g_menuWnd, nullptr, FALSE); return; }
     if (p.current) { Toast(L"你已经在这里了"); InvalidateRect(g_menuWnd, nullptr, FALSE); return; }
     FILE* f = nullptr;
     if (_wfopen_s(&f, DATA_DIR L"teleport.req", L"wb") == 0 && f) {
@@ -1036,6 +1056,23 @@ static void PadPrime(XINPUT_GAMEPAD& g) {
         }
     }
 }
+// 0 = released, 1 = bridged single Y, 2 = native combination; keep that choice until Y is released.
+static int g_speedKey = 0;
+static void PadBattleSpeed(XINPUT_GAMEPAD& g, bool active) {
+    bool down = (g.wButtons & XINPUT_GAMEPAD_Y) != 0;
+    if (!down) { g_speedKey = 0; return; }
+    LONG enabled = InterlockedCompareExchange(&g_speedInput, 0, 0);
+    DWORD heartbeat = (DWORD)InterlockedCompareExchange(&g_speedInputTick, 0, 0);
+    bool ready = active && enabled && GetTickCount() - heartbeat < 500;
+    if (g_speedKey == 1 && !ready) g_speedKey = 2;  // even a held Y is released when Lua stops updating
+    if (g_speedKey == 0) {
+        bool single = !(g.wButtons & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) &&
+            g.bLeftTrigger <= 40 && g.bRightTrigger <= 40;
+        g_speedKey = ready && single ? 1 : 2;
+        if (g_speedKey == 1) { InterlockedIncrement(&g_ev[6]); Log("battle Y -> speed cycle"); }
+    }
+    if (g_speedKey == 1) g.wButtons &= ~XINPUT_GAMEPAD_Y;
+}
 static void ReleaseClick() { if (g_aClick) { MouseBtn(false); g_aClick = false; } }
 static DWORD Handle(PFN_GetState fn, DWORD idx, XINPUT_STATE* s) {
     if (!fn) return ERROR_DEVICE_NOT_CONNECTED;
@@ -1045,6 +1082,7 @@ static DWORD Handle(PFN_GetState fn, DWORD idx, XINPUT_STATE* s) {
     if ((LONG)idx != g_primary) return r;
     XINPUT_GAMEPAD& g = s->Gamepad;
     bool focus = GameFocused();
+    PadBattleSpeed(g, focus && !g_mapOpen && !g_menuOpen);  // Lua's heartbeat limits this to a real fight
     if (focus && !g_menuOpen) PadPrime(g);
     // the world map cannot be open during a real fight, but battle.flag is also 1 on the overworld (LV_World):
     // map state wins, so Y / the teleport panel work when the map is opened from the overworld
