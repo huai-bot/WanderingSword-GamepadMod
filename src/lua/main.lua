@@ -1,4 +1,4 @@
-print("[GamepadTweaks] v4.30 loaded\n")
+print("[GamepadTweaks] v4.39 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
@@ -37,14 +37,14 @@ if RUNTIME.claim and writeFile("runtime_claim.req", RUNTIME.token) then
   RUNTIME.call(RUNTIME.claim); os.remove(DIR .. "runtime_claim.req")
 end
 if not runtimePoll() then
-  print("[GamepadTweaks] runtime unavailable; install matching v4.30 DLL and Lua together\n")
+  print("[GamepadTweaks] runtime unavailable; install matching v4.31 DLL and Lua together\n")
   return
 end
 local nativeRegisterHook = RegisterHook
 local function RegisterHook(path, before, after)
   local function owned(fn)
     if not fn then return nil end
-    return function(...) if RUNTIME.owner then return fn(...) end end
+    return function(...) if RUNTIME.owner and RUNTIME.playing and not RUNTIME.loading then return fn(...) end end
   end
   if after then return nativeRegisterHook(path, owned(before), owned(after)) end
   return nativeRegisterHook(path, owned(before))
@@ -63,21 +63,46 @@ end
 local pauseUntil = 0          -- world-dependent work idles until this time (map loads, teleports)
 local lastLevel = nil
 
+function RUNTIME.world()
+  if RUNTIME.loading then return end
+  if not live(RUNTIME.viewport) then
+    local engine = FindFirstOf("GameEngine")
+    if not live(engine) then return end
+    RUNTIME.viewport = engine.GameViewport
+  end
+  local viewport = RUNTIME.viewport
+  if not live(viewport) then return end
+  local world = viewport.World
+  if not live(world) or world:GetFName():ToString() == "LV_NewGame" then return end
+  local instance = viewport.GameInstance
+  if live(instance) then return world, instance end
+end
+function RUNTIME.player()
+  local world, instance = RUNTIME.world()
+  if not world then return end
+  local level, players = world.PersistentLevel, instance.LocalPlayers
+  if not live(level) then return end
+  if not players or #players == 0 then return nil, nil, world, instance, level end
+  local player = players[1]
+  local controller = live(player) and player.PlayerController
+  if not live(controller) or controller:IsActorBeingDestroyed() then return nil, nil, world, instance, level end
+  local outer = controller:GetOuter()
+  if not live(outer) or outer:GetAddress() ~= level:GetAddress() then return nil, nil, world, instance, level end
+  local pawn = controller.Pawn
+  if not live(pawn) or pawn:IsActorBeingDestroyed() then return nil, nil, world, instance, level end
+  local owner, pawnLevel = pawn.Controller, pawn:GetOuter()
+  if not live(owner) or owner:GetAddress() ~= controller:GetAddress() or not live(pawnLevel)
+    or pawnLevel:GetAddress() ~= level:GetAddress() then return nil, nil, world, instance, level end
+  return controller, pawn, world, instance, level
+end
+
 -- returns pc, pawn, level, pawnFullName when the world is stable; otherwise nil
 local function stableWorld()
   if now() < pauseUntil then return nil end
-  local pc = FindFirstOf("BP_PlayerController_C")
-  if not live(pc) or not live(pc.Pawn) then
-    pc = nil
-    for _, candidate in ipairs(FindAllOf("BP_PlayerController_C") or {}) do
-      if live(candidate) and live(candidate.Pawn) then pc = candidate; break end
-    end
-    if not pc then return nil end
-  end
-  local pawn = pc.Pawn
+  local pc, pawn, world = RUNTIME.player()
+  if not pc then return end
   local full = pawn:GetFullName()
-  local lv = full:match("%.([%w_]+):PersistentLevel")
-  if not lv then return nil end
+  local lv = world:GetFName():ToString()
   if lv ~= lastLevel then lastLevel = lv; pauseUntil = now() + 5; writeFile("cur.txt", lv); return nil end
   return pc, pawn, lv, full
 end
@@ -237,8 +262,8 @@ local function writeBattleFlag()
   if inFight ~= fightFlag and writeFile("fight.flag", inFight and "1" or "0") then fightFlag = inFight end   -- proxy: Start native only here
 end
 local shownChain
-local function taskMapFlag()
-  local open = false
+local function taskMapFlag(intent)
+  local view
   -- UI visibility is not world readiness. It is safe to inspect widgets during
   -- the post-travel cooldown; taskTeleport still requires a stable field pawn.
   if not inFight then
@@ -246,39 +271,39 @@ local function taskMapFlag()
     for _, w in ipairs(FindAllOf("JHNeoUIWorldMapViewBase") or {}) do
       if live(w) then
         local ok, shown = pcall(shownChain, w, memo, 0)
-        if ok and shown then open = true; break end
+        if ok and shown then view = w; break end
       end
     end
   end
-  local v = open and "1" or "0"
+  local v = view and "1" or "0"
   if v ~= lastMap and writeFile("map.flag", v) then lastMap = v; writeBattleFlag() end
-end
-
--- ---------------------------------------------------------------- 3) visited levels -> safe landing points
--- A level is "visited" once the hero has stood on the ground there for 2 s. The stored point is refreshed
--- (at most every 20 s) to where the hero last stood on solid ground, so it is always a real walkable spot.
--- (v4.3 stored the very first position after a load, which can be a staging point in the air/under the map.)
-local visited = {}          -- lv -> { x, y, z }
-do
-  local s = readFirst("visited.txt")
-  local byPos = {}
-  if s then for line in s:gmatch("[^\n]+") do
-    local lv, x, y, z = line:match("^([^|]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)")
-    if lv then visited[lv] = { x = tonumber(x), y = tonumber(y), z = tonumber(z) }; local k = x .. "|" .. y .. "|" .. z; byPos[k] = (byPos[k] or 0) + 1 end
-  end end
-  -- identical coordinates in two different levels cannot both be real: drop them, they get re-recorded
-  for lv, p in pairs(visited) do
-    local k = string.format("%.0f|%.0f|%.0f", p.x, p.y, p.z)
-    if (byPos[k] or 0) > 1 then visited[lv] = nil; print("[GamepadTweaks] visited: dropped suspicious point for " .. lv .. "\n") end
+  if intent and not inFight then
+    if intent == "m" and view then
+      local vm = view:GetNeoUIVM()
+      if live(vm) then vm:Hide() end
+    elseif intent == "M" and not view then
+      local pc, _, _, full = stableWorld()
+      if pc and (full:find("BP_SceneHero", 1, true) or full:find("BP_WorldHero", 1, true)) then
+        pc:HandleOpenWorldMap()
+      end
+    end
   end
 end
+
+local visited = {}
+do
+  local s = readFirst("visited.txt")
+  if s then for line in s:gmatch("[^\n]+") do
+    local lv = line:match("^([%w_]+)|") or line:match("^([%w_]+)%s*$")
+    if lv then visited[lv] = line:gsub("\r$", "") end
+  end end
+end
 local function saveVisited()
-  local t = {} for lv, p in pairs(visited) do t[#t + 1] = string.format("%s|%.0f|%.0f|%.0f", lv, p.x, p.y, p.z) end table.sort(t)
+  local t = {} for _, line in pairs(visited) do t[#t + 1] = line end table.sort(t)
   writeFile("visited.txt", table.concat(t, "\n") .. "\n")
 end
-saveVisited()
-local arrival -- suppress visited updates until the destination is actually grounded
-local ground = { lv = nil, since = 0, lastSave = 0 }
+local arrival
+local ground = { lv = nil, since = 0 }
 local function onGround(pawn)
   local m = pawn.CharacterMovement
   if not m or not m:IsValid() or m:IsFalling() then return false end
@@ -292,25 +317,96 @@ local function taskVisited()
   if not onGround(pawn) then ground.lv = nil return end
   if ground.lv ~= lv then ground.lv = lv; ground.since = now() return end
   if now() - ground.since < 2 then return end
-  local l = pawn:K2_GetActorLocation()
-  local p = visited[lv]
-  if not p then
-    visited[lv] = { x = l.X, y = l.Y, z = l.Z }; saveVisited(); ground.lastSave = now()
+  if not visited[lv] then
+    local pos = pawn:K2_GetActorLocation()
+    visited[lv] = string.format("%s|%.0f|%.0f|%.0f", lv, pos.X, pos.Y, pos.Z); saveVisited()
     print("[GamepadTweaks] visited " .. lv .. "\n")
-  elseif now() - ground.lastSave > 20 and ((l.X - p.x) ^ 2 + (l.Y - p.y) ^ 2 + (l.Z - p.z) ^ 2) > 300 * 300 then
-    p.x, p.y, p.z = l.X, l.Y, l.Z; saveVisited(); ground.lastSave = now()
   end
 end
 
--- ---------------------------------------------------------------- 4) teleport request "LEVEL|x|y|z"
--- ChangeSceneMap already starts the load; calling task:StartChangeMap() as well loaded the map twice (v4.3 bug).
--- After arrival a watchdog checks the hero for 25 s; if it is falling / below the target / gone, it is moved
--- to the level's PlayerStart (the game's own spawn point).
+local TRAVEL = { anchors = {}, hosts = {} }
+do
+  for _, id in ipairs({10015,10102,10132,10220,11600,11900,12000,12105,13108,13208,16041,16401,17002,17038,19109,19300,19500,19835}) do TRAVEL.hosts[id] = true end
+  local function vector(text)
+    local x, y, z = text:match("^(%-?%d+),(%-?%d+),(%-?%d+)$")
+    if x then return {X=tonumber(x),Y=tonumber(y),Z=tonumber(z)} end
+  end
+  for line in (readFirst("landings.txt") or ""):gmatch("[^\r\n]+") do
+    local level, entry, kind, door, keeper = line:match("^([%w_]+)\t([^\t]+)\t(%l+)\t([^\t]+)\t([^\t]+)$")
+    if level and vector(entry) then
+      local id, home = keeper:match("^(%d+),(.+)$")
+      TRAVEL.anchors[level] = {entry=vector(entry), kind=kind, door=vector(door), keeper=tonumber(id), home=home and vector(home)}
+      if id then TRAVEL.hosts[tonumber(id)] = true end
+    end
+  end
+end
+function TRAVEL.distance(first, second)
+  return (first.X-second.X)^2 + (first.Y-second.Y)^2
+end
+function TRAVEL.place(pawn, target)
+  local capsule, movement = pawn.CapsuleComponent, pawn.CharacterMovement
+  if not live(capsule) or not live(movement) then return end
+  local nav = StaticFindObject("/Script/NavigationSystem.Default__NavigationSystemV1")
+  if not nav or not nav:IsValid() then return end
+  local function project(point, width, height)
+    local out = {}
+    if nav:K2_ProjectPointToNavigation(pawn, point, out, nil, nil, {X=width,Y=width,Z=height})
+      and out.X and TRAVEL.distance(point, out) <= width^2 and math.abs(out.Z-point.Z) <= height then return out end
+  end
+  local base = project(target, 48, 128); if not base then return end
+  local walkout = false
+  for _, direction in ipairs({{1,0},{-1,0},{0,1},{0,-1}}) do
+    local exit = project({X=base.X+direction[1]*140,Y=base.Y+direction[2]*140,Z=base.Z}, 36, 90)
+    if exit then
+      local path = nav:FindPathToLocationSynchronously(pawn, base, exit, pawn, nil)
+      if live(path) and not path:IsPartial() and #path.PathPoints >= 2 then walkout = true; break end
+    end
+  end
+  if not walkout then return end
+  local spot = {X=base.X,Y=base.Y,Z=base.Z+capsule:GetScaledCapsuleHalfHeight()+8}
+  local floor = {}; movement:K2_FindFloor(spot, floor)
+  if not floor.bWalkableFloor then return end
+  local gap = floor.bLineTrace and floor.LineDist or floor.FloorDist
+  if not gap or gap < -2 or gap > 48 then return end
+  spot.Z = spot.Z - gap + 2
+  local before = pawn:K2_GetActorLocation()
+  if onGround(pawn) and TRAVEL.distance(before, spot) < 12^2 and math.abs(before.Z-spot.Z) < 16 then return spot end
+  if pawn:K2_TeleportTo(spot, pawn:K2_GetActorRotation()) then
+    movement:StopMovementImmediately()
+    local landed = pawn:K2_GetActorLocation()
+    if TRAVEL.distance(landed, spot) <= 48^2 and math.abs(landed.Z-spot.Z) <= 48 then return spot end
+    pawn:K2_TeleportTo(before, pawn:K2_GetActorRotation())
+  end
+end
+function TRAVEL.host(pawn, anchor)
+  local library = StaticFindObject("/Script/Engine.Default__GameplayStatics")
+  local class = StaticFindObject("/Game/JH/Core/Characters/BP_SceneNPC.BP_SceneNPC_C")
+  if not library or not library:IsValid() or not class or not class:IsValid() then return end
+  local actors = {}; library:GetAllActorsOfClass(pawn, class, actors)
+  local pick, best, bestId
+  for _, actor in ipairs(actors) do
+    if type(actor) == "userdata" and not actor.IsValid and actor.get then actor = actor:get() end
+    if live(actor) and not actor:IsActorBeingDestroyed() and not actor.bHidden and TRAVEL.hosts[actor.NPCId] then
+      local id = tonumber(actor.NPCId)
+      local pos = actor:K2_GetActorLocation()
+      local distance = TRAVEL.distance(pos, anchor.home or anchor.entry)
+      if id == anchor.keeper then distance = distance - 1e12 end
+      if not pick or distance < best or distance == best and id < bestId then pick, best, bestId = actor, distance, id end
+    end
+  end
+  if not pick then return end
+  local pos, sprite = pick:K2_GetActorLocation(), pick.Sprite
+  local offset = live(sprite) and ({[0]=-90,0,90,180})[tonumber(sprite.FlipbookDirect)]
+  local camera = pawn.Controller.PlayerCameraManager
+  if not offset or not live(camera) then return end
+  local angle = math.rad(camera:GetCameraRotation().Yaw + offset)
+  return {X=pos.X+math.cos(angle)*96,Y=pos.Y+math.sin(angle)*96,Z=pos.Z}
+end
 local function changeMap(pc, lv, x, y, z)
   local cdo = StaticFindObject("/Script/JH.Default__AsyncTaskChangeSceneMap")
   return cdo:ChangeSceneMap(pc, FName(lv), { X = x, Y = y, Z = z }, 0, true, true, true, true, false)
 end
-local pendingTravel
+local pendingTravel, travelSerial = nil, 0
 local function taskTeleport()
   if not pendingTravel then
     local line = readFirst("teleport.req"); if not line then return end
@@ -323,10 +419,9 @@ local function taskTeleport()
   end
   local pc, pawn, cur, full = stableWorld(); if not pc then return end
   pendingTravel = nil -- never replay after changing the map
-  local lv, x, y, z = req.line:match("^([%w_]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)")
-  if not lv then return end
-  -- any field pawn may teleport (scene hero, overworld hero BP_WorldHero1_C); never from a fight
-  if inFight or full:find("BP_FightSpectator") then print("[GamepadTweaks] teleport skipped: in a fight\n") return end
+  local lv = req.line:match("^([%w_]+)%s*$") or req.line:match("^([%w_]+)|")
+  local anchor = lv and visited[lv] and TRAVEL.anchors[lv]
+  if not anchor or not (full:find("BP_SceneHero",1,true) or full:find("BP_WorldHero",1,true)) then return end
   local ui = getUI()
   local blocked = inFight
   if ui then
@@ -334,53 +429,49 @@ local function taskTeleport()
     pcall(function() local d = ui:GetDialogView(); if d and d:IsValid() and d:IsVisible() then blocked = true end end)
   end
   if blocked then print("[GamepadTweaks] teleport skipped: battle/dialog\n") return end
-  local tx, ty, tz = tonumber(x), tonumber(y), tonumber(z)   -- panel sends the station point or our refreshed safe point
-  pauseUntil = now() + 12
+  local _, _, world = RUNTIME.player(); if not world then return end
+  local source = cur ~= lv and world:GetAddress()
   if ui and ui:IsValid() then pcall(function() ui:GotoDefaultStatus() end) end
-  changeMap(pc, lv, tx, ty, tz + 30)
-  arrival = { lv = lv, z = tz, at = now(), fallSince = nil, rescued = false }
-  print(string.format("[GamepadTweaks] teleport -> %s (%.0f %.0f %.0f)\n", lv, tx, ty, tz))
-end
-local function playerStart(lv)
-  for _, s in ipairs(FindAllOf("PlayerStart") or {}) do
-    if live(s) and s:GetFullName():find("." .. lv .. ":PersistentLevel.", 1, true) then
-      local l = s:K2_GetActorLocation(); return l.X, l.Y, l.Z
-    end
+  travelSerial = travelSerial + 1
+  arrival = {lv=lv, anchor=anchor, at=now(), retry=0, source=source}
+  if source then
+    local pos = anchor.entry
+    pauseUntil = now() + 12
+    changeMap(pc, lv, pos.X, pos.Y, pos.Z)
   end
+  print(string.format("[GamepadTweaks] teleport -> %s (fixed %s)\n", lv, anchor.kind))
 end
 local function taskArrival()
   local a = arrival; if not a then return end
-  local t = now() - a.at
-  if t > 40 or inFight then arrival = nil; return end
-  local pc = FindFirstOf("BP_PlayerController_C"); if not live(pc) or not live(pc.Pawn) then return end
-  local pawn = pc.Pawn; local full = pawn:GetFullName()
-  if not full:find("." .. a.lv .. ":PersistentLevel.", 1, true) or not full:find("BP_SceneHero", 1, true) then
-    if a.seen then arrival = nil end; return
+  local clock = now()
+  if clock-a.at > 35 or inFight then arrival = nil; return end
+  local _, pawn, world = RUNTIME.player()
+  if world and world:GetAddress() ~= a.source and world:GetFName():ToString() ~= a.lv then arrival = nil; return end
+  if not pawn or world:GetFName():ToString() ~= a.lv or world:GetAddress() == a.source
+    or not pawn:GetClass():GetFName():ToString():find("BP_SceneHero",1,true) then
+    if a.ready then arrival = nil end; return
   end
-  local l = pawn:K2_GetActorLocation()
-  -- Ignore the pre-placement pawn seen during a same-level load.
-  if not a.seen and t < 1 then return end
-  a.seen = true
-  local grounded = onGround(pawn)
-  local low = l.Z < a.z - 180
-  if grounded and not low then
-    a.stood = a.stood or now()
-    if now() - a.stood >= 0.6 then
-      if a.rescued then visited[a.lv] = {x=l.X,y=l.Y,z=l.Z}; saveVisited() end
-      arrival = nil
-    end
-    return
+  if clock < a.retry then return end
+  a.retry = clock + 0.35
+  local pos = pawn:K2_GetActorLocation()
+  a.ready = a.ready or clock
+  if a.placed then
+    if onGround(pawn) and math.abs(pos.Z-a.placed.Z) < 100 then arrival = nil; return end
+    if clock-a.placedAt < 1.2 then return end
+    a.forceEntry = true
   end
-  a.stood = nil
-  if grounded then a.fallSince = nil else a.fallSince = a.fallSince or now() end
-  if a.rescued or (not low and (not a.fallSince or now() - a.fallSince < 1.5)) then return end
-  local sx, sy, sz = playerStart(a.lv); if not sx then return end
-  if a.tryAt and now() < a.tryAt then return end
-  a.tryAt = now() + 1
-  if pawn:K2_TeleportTo({X=sx,Y=sy,Z=sz+30}, pawn:K2_GetActorRotation()) then
-    pawn.CharacterMovement:StopMovementImmediately(); a.rescued, a.z, a.fallSince = true, sz, nil
-    print(string.format("[GamepadTweaks] arrival rescue in place: %s z %.0f -> %.0f\n", a.lv,l.Z,sz))
+  if a.rest and not a.placed and TRAVEL.distance(pos,a.rest) > 96^2 then arrival = nil; return end
+  if not a.rest and onGround(pawn) then a.rest = {X=pos.X,Y=pos.Y} end
+  local anchor, spot = a.anchor
+  if not a.forceEntry and anchor.door then spot = TRAVEL.place(pawn,anchor.door) end
+  if not spot and not a.forceEntry and anchor.kind ~= "entry" then
+    local host = TRAVEL.host(pawn,anchor)
+    if host then spot = TRAVEL.place(pawn,host) end
+    if not spot and clock-a.ready < 1.5 then return end
   end
+  if not spot then spot = TRAVEL.place(pawn,anchor.entry) end
+  if spot then a.placed, a.placedAt = spot, clock
+  elseif clock-a.ready > 5 then arrival = nil; print("[GamepadTweaks] arrival: no validated relocation in " .. a.lv .. "\n") end
 end
 
 -- ---------------------------------------------------------------- 5) maintenance command channel
@@ -465,73 +556,259 @@ end
 
 local eachArr -- assigned before the scheduler starts; also used to collect every matching sprite
 -- ---------------------------------------------------------------- 7b) walking appearance, without changing fast-run state/speed/mount buffs
--- Remap only mounted visuals; ordinary idle/run and frame progression belong to the native sprite.
--- Followers use a version-checked native renderer copy; the real mount, speed and buffs are never toggled.
-local WALK = { on = false, pawn = nil, targets = {}, originals = {}, findAt = 0, cfgAt = 0, cfg = false,
+local WALK = { on = false, pawn = nil, originals = {}, findAt = 0, cfgAt = 0, cfg = false,
   rebuildAt = 0, followerCount = nil, bridge = package.loadlib(DLLPATH, "wsmod_walk_rebuild"), warned = false }
--- The native renderer indexes FastRunFlipbooks and RunFlipbooks by the same facing.
--- Override instance slots, not shared assets. A later native state=9 then selects the
--- same flipbook as state=2, so switching states does not reset playback to frame zero.
-function WALK.slots(sprite, saved, restore)
-  if sprite.bShipType then return end
-  local run, fast = sprite.RunFlipbooks, sprite.FastRunFlipbooks
-  if not run or not fast then return end
-  fast:ForEach(function(i, slot)
-    local current = slot:get(); if not current or not current:IsValid() then return end
-    local old = saved[i]
-    if restore then
-      if old and current:GetAddress() == old.applied then
-        local orig = old.asset
-        if not orig:IsValid() then orig = LoadAsset(old.path) end
-        if orig and orig:IsValid() then slot:set(orig) end
-      end
-    elseif i <= #run then
-      local normal = run[i]
-      if normal and normal:IsValid() and normal:GetAddress() ~= current:GetAddress() then
-        if not old or current:GetAddress() ~= old.applied then
-          old = { asset = current, path = current:GetFullName():match('%S+ (.+)') }; saved[i] = old
-        end
-        slot:set(normal); old.applied = normal:GetAddress()
-      end
-    end
-  end)
+function WALK.field()
+  local _, pawn, world, instance, level = RUNTIME.player()
+  if not pawn then return end
+  local class = pawn:GetClass():GetFName():ToString()
+  if inFight or class:find("BP_FightSpectator", 1, true) then WALK.afterFight = true; return end
+  if not (class:find("BP_SceneHero", 1, true) or class:find("BP_WorldHero", 1, true)) or not live(pawn.RootComponent) then return end
+  local name = world:GetFName():ToString()
+  if arrival and name ~= arrival.lv then return end
+  return pawn, name, instance, level:GetAddress()
 end
-local function walkApply()
-  if not WALK.on then return end
-  for _, target in ipairs(WALK.targets) do
-    local actor, sprite = target.actor, target.sprite
-    if live(actor) and live(sprite) then
-      if sprite.DefaultRunAnimalState == 9 then sprite.DefaultRunAnimalState = 2 end
-      if sprite.DefaultIdleAnimalState == 9 then sprite.DefaultIdleAnimalState = 1 end
-      -- Keep the game's animation driver: followers can move by transform with
-      -- zero reported velocity. Never overwrite ordinary idle/run every tick.
-      if sprite.AnimalState == 9 then sprite.AnimalState = 2 end
-      if target.hero and not sprite.bShipType and sprite.AnimalState == 2 and not sprite:IsPlaying() then
-        sprite:SetLooping(true); sprite:Play() -- resume, never PlayFromStart every tick
+function WALK.asset(path)
+  if not path or path == "None" then return nil end
+  local asset = StaticFindObject(path)
+  if not asset or not asset:IsValid() then LoadAsset(path); asset = StaticFindObject(path) end
+  if asset and asset:IsValid() then return asset end
+end
+function WALK.feet(pawn, instance)
+  local id = tonumber(pawn.NPCId) or 0
+  if id < 20 and id ~= 2 then id = 0 end
+  if WALK.npc ~= id or not live(WALK.info) then
+    WALK.npc, WALK.info = id, nil
+    for _, mgr in ipairs(FindAllOf("NPCManager") or {}) do
+      if live(mgr) then
+        local outer = mgr:GetOuter()
+        if live(outer) and outer:GetAddress() == instance:GetAddress() then
+          WALK.info = mgr:GetNPCInfo(id, false); if live(WALK.info) then break end
+        end
       end
     end
+  end
+  if not live(WALK.info) then return end
+  local name = WALK.info.AvatarResourceName:ToString()
+  if name == "None" or name == "" then
+    local defs = StaticFindObject("/Game/JH/Tables/NPCs.NPCs")
+    local def = live(defs) and defs:FindRow(tostring(id))
+    if not def then return end
+    name = def.ResourceName:ToString()
+  end
+  if WALK.skin == name and WALK.ground then return WALK.ground end
+  if WALK.lookup == name and now() < WALK.retryAt then return end
+  WALK.lookup, WALK.retryAt = name, now() + 0.15
+  local resources = StaticFindObject("/Game/JH/Tables/NPCResources.NPCResources")
+  local row = live(resources) and resources:FindRow(name)
+  if not row then return end
+  local ground = { Idle = {}, Run = {} }
+  for _, group in ipairs({"Idle", "Run"}) do
+    for index, facing in ipairs({"Left", "Up", "Right", "Down"}) do
+      local ref = row[group .. facing .. "Flipbook"]
+      local path = ref:GetObjectID():GetAssetPathName():ToString()
+      local asset = WALK.asset(path)
+      if not asset then return end
+      ground[group][index] = asset
+    end
+  end
+  WALK.skin, WALK.ground = name, ground
+  print("[GamepadTweaks] walking: loaded four ground facings for " .. name .. "\n")
+  return ground
+end
+function WALK.park(sprite, saved, enabled)
+  local hold = saved.hold
+  if not hold then return end
+  if not enabled then
+    for index, entry in pairs(hold.slots) do
+      local idle = sprite.IdleFlipbooks
+      local current = index <= #idle and idle[index]
+      if current and current:IsValid() and current:GetAddress() == entry.applied then
+        local original = entry.asset:IsValid() and entry.asset or WALK.asset(entry.path)
+        if original then idle[index] = original end
+      end
+    end
+    if sprite.DefaultRunAnimalState == 0 then sprite.DefaultRunAnimalState = hold.run end
+    saved.hold = nil
+    return
+  end
+  local idle = sprite.IdleFlipbooks
+  local clip = hold.facing + 1 <= #idle and idle[hold.facing + 1]
+  if not clip or not clip:IsValid() then return end
+  local address = clip:GetAddress()
+  for index = 1, math.min(4, #idle) do
+    local current = idle[index]
+    if current and current:IsValid() and current:GetAddress() ~= address then
+      local entry = hold.slots[index]
+      if not entry or current:GetAddress() ~= entry.applied then
+        entry = {asset = current, path = current:GetFullName():match("^%S+ (.+)$")}; hold.slots[index] = entry
+      end
+      idle[index], entry.applied = clip, address
+    end
+  end
+  if sprite.DefaultRunAnimalState ~= 0 then hold.run = sprite.DefaultRunAnimalState; sprite.DefaultRunAnimalState = 0 end
+  if sprite.AnimalState ~= 0 then sprite.AnimalState = 0 end
+  local current = sprite:GetFlipbook()
+  if not current or not current:IsValid() or current:GetAddress() ~= address then sprite:SetFlipbook(clip) end
+end
+function WALK.rest(actor, sprite, saved, clock)
+  local state = sprite.AnimalState
+  if saved.hero or sprite.bShipType or (state ~= 0 and state ~= 2 and state ~= 9) then
+    WALK.park(sprite, saved, false); saved.anchor = nil; return
+  end
+  local point = actor:K2_GetActorLocation()
+  local anchor = saved.anchor
+  if not anchor or (point.X - anchor.X)^2 + (point.Y - anchor.Y)^2 > 3^2 or math.abs(point.Z - anchor.Z) > 6 then
+    WALK.park(sprite, saved, false)
+    saved.anchor = {X = point.X, Y = point.Y, Z = point.Z, since = clock}
+  elseif clock - anchor.since >= 0.25 then
+    local facing = sprite.FlipbookDirect
+    if facing >= 0 and facing < 4 then
+      saved.hold = saved.hold or {facing = facing, run = sprite.DefaultRunAnimalState, slots = {}}
+      WALK.park(sprite, saved, true)
+    end
+  end
+end
+function WALK.slots(sprite, saved, ground, restoring)
+  if restoring then WALK.park(sprite, saved, false) end
+  local idle, run, fast = sprite.IdleFlipbooks, sprite.RunFlipbooks, sprite.FastRunFlipbooks
+  local changed = false
+  local function bind(slots, index, originals, source, desired)
+    if index > #slots then return end
+    local current = slots[index]
+    if not current or not current:IsValid() then return end
+    local address, previous = current:GetAddress(), originals[index]
+    local ours = previous and address == previous.applied and source == previous.source
+    if restoring then
+      if not ours then return end
+      desired = previous.asset
+      if not desired:IsValid() then desired = WALK.asset(previous.path) end
+    elseif desired and desired:IsValid() then
+      if address == desired:GetAddress() then
+        if not ours then originals[index] = nil end
+        return
+      end
+      if not ours then
+        previous = {asset = current, before = address, path = current:GetFullName():match("^%S+ (.+)$")}; originals[index] = previous
+      end
+      previous.applied, previous.source = desired:GetAddress(), source
+    else
+      if ground then WALK.ground = nil end
+      return
+    end
+    if desired then slots[index] = desired; changed = true end
+  end
+  for index = 1, 4 do
+    local witness = index <= #fast and fast[index]
+    local source = witness and witness:IsValid() and witness:GetAddress() or 0
+    local previous = saved.FastRun[index]
+    if previous and previous.applied == source then source = previous.source end
+    if saved.hero then
+      bind(idle, index, saved.Idle, source, ground and ground.Idle[index])
+      bind(run, index, saved.Run, source, ground and ground.Run[index])
+    end
+    local foot = ground and ground.Run[index] or (not saved.hero and index <= #run and run[index])
+    bind(fast, index, saved.FastRun, source, foot)
+  end
+  if sprite.bShipType then return end
+  local state = sprite.AnimalState
+  local active = state == 0 and idle or state == 2 and run or state == 9 and fast
+  if not active then return end
+  local facing = sprite.FlipbookDirect + 1
+  if facing < 1 or facing > 4 or facing > #active then return end
+  local clip = active[facing]
+  if not clip or not clip:IsValid() then return end
+  local current = sprite:GetFlipbook()
+  local displayed = current and current:IsValid() and current:GetAddress()
+  local original = (state == 0 and saved.Idle or state == 2 and saved.Run or saved.FastRun)[facing]
+  if displayed ~= clip:GetAddress() and (changed or not displayed or original and displayed == original.before) then sprite:SetFlipbook(clip) end
+  if not restoring and saved.hero and (state == 2 or state == 9) and ground and ground.Run[facing]:IsValid()
+    and clip:GetAddress() == ground.Run[facing]:GetAddress() and not sprite:IsPlaying() then sprite:SetLooping(true); sprite:Play() end
+end
+function WALK.formation(pawn, level, members, clock)
+  local position = pawn:K2_GetActorLocation()
+  local function distance(first, second) return (first.X - second.X)^2 + (first.Y - second.Y)^2 end
+  local team = WALK.team
+  if not team or team.level ~= level or team.trip ~= travelSerial or distance(team.origin, position) > 320^2
+    or math.abs(team.origin.Z - position.Z) > 160 then
+    team = {level = level, trip = travelSerial, offsets = {}, seen = {}}; WALK.team = team
+  end
+  team.origin = {X = position.X, Y = position.Y, Z = position.Z}
+  if WALK.afterFight then team.seen = {}; WALK.afterFight = false end
+  local occupied, current, crowded = {team.origin}, {}, {}
+  local function free(point)
+    for _, other in ipairs(occupied) do if distance(point, other) < 36^2 then return false end end
+    return true
+  end
+  for index, actor in ipairs(members) do
+    local name = actor:GetFName():ToString()
+    local key = tonumber(actor.NPCId) or name
+    local state = team.seen[name] or {untilAt = clock + 1.5, retry = 0}
+    current[name] = state
+    local point = actor:K2_GetActorLocation()
+    if free(point) then
+      occupied[#occupied + 1] = point
+      if distance(position, point) <= 700^2 and math.abs(point.Z - position.Z) < 150 then
+        team.offsets[key] = {X = point.X - position.X, Y = point.Y - position.Y, Z = point.Z - position.Z}
+      end
+    elseif clock <= state.untilAt and clock >= state.retry then
+      state.retry = clock + 0.2
+      crowded[#crowded + 1] = {index = index, actor = actor, offset = team.offsets[key], state = state}
+    end
+  end
+  team.seen = current
+  if #crowded == 0 then return end
+  local forward, movement = pawn:GetActorForwardVector(), pawn.CharacterMovement
+  local capsule = pawn.CapsuleComponent
+  if not live(capsule) then return end
+  local heroHeight = capsule:GetScaledCapsuleHalfHeight()
+  local function place(actor, offset)
+    local followerCapsule = actor.CapsuleComponent
+    if not live(followerCapsule) then return false end
+    local point = {X = position.X + offset.X, Y = position.Y + offset.Y, Z = position.Z + offset.Z}
+    if not free(point) then return false end
+    local floor = {}; movement:K2_FindFloor(point, floor)
+    if not floor.bWalkableFloor then return false end
+    point.Z = point.Z - (floor.bLineTrace and floor.LineDist or floor.FloorDist) + 2
+      + followerCapsule:GetScaledCapsuleHalfHeight() - heroHeight
+    if not actor:K2_TeleportTo(point, actor:K2_GetActorRotation()) then return false end
+    local landed = actor:K2_GetActorLocation()
+    if not free(landed) then return false end
+    occupied[#occupied + 1] = landed
+    return true
+  end
+  for _, member in ipairs(crowded) do
+    local placed = member.offset and place(member.actor, member.offset)
+    if not placed then
+      local back = 64 * member.index
+      for attempt, side in ipairs({0, 64, -64, back, -back}) do
+        local along = attempt <= 3 and back or 0
+        placed = place(member.actor, {X = -along * forward.X - side * forward.Y, Y = -along * forward.Y + side * forward.X, Z = 0})
+        if placed then break end
+      end
+    end
+    if placed then member.state.untilAt = -1 end
   end
 end
 local function taskWalkAppearance()
-  local pc, pawn, lv, full = stableWorld(); if not pc then return end
-  if inFight or not (full:find("BP_SceneHero", 1, true) or full:find("BP_WorldHero", 1, true)) then return end
-  if now() >= WALK.cfgAt then WALK.cfg, WALK.cfgAt = iniNumber("walk_appearance", 0) == 1, now() + 1 end
-  if WALK.pawn ~= pawn:GetAddress() then
-    WALK.pawn, WALK.targets, WALK.originals, WALK.findAt, WALK.on, WALK.followerCount, WALK.rebuildAt = pawn:GetAddress(), {}, {}, 0, false, nil, 0
+  local clock = RUNTIME.clock or now()
+  if clock >= WALK.cfgAt then WALK.cfg, WALK.cfgAt = iniNumber("walk_appearance", 0) == 1, clock + 1 end
+  if (not WALK.cfg and not WALK.on) or clock < WALK.findAt then return end
+  WALK.findAt = clock + 0.08
+  local pawn, lv, instance, level = WALK.field(); if not pawn then return end
+  if WALK.pawn ~= pawn:GetAddress() or WALK.level ~= level then
+    WALK.pawn, WALK.level, WALK.originals, WALK.on, WALK.followerCount, WALK.rebuildAt = pawn:GetAddress(), level, {}, false, nil, 0
+    WALK.info, WALK.skin, WALK.ground, WALK.lookup = nil, nil, nil, nil
   end
   if not WALK.cfg then
-    if WALK.on then
+    if WALK.on and onGround(pawn) then
       WALK.on = false
-      for _, original in ipairs(WALK.originals) do
-        if live(original.sprite) then
-          if next(original.slots) then WALK.slots(original.sprite, original.slots, true) end
-          original.sprite.bAutoCalcRunOrIdleState = original.auto
-          original.sprite.DefaultRunAnimalState, original.sprite.DefaultIdleAnimalState = original.run, original.idle
-        end
+      for _, original in pairs(WALK.originals) do
+        if live(original.sprite) then WALK.slots(original.sprite, original, nil, true) end
       end
       if WALK.followerCount then pawn.FollowerCount = WALK.followerCount end
-      pawn:RebuidFollowers(); pawn:KeepFastRunState() -- restore today's real fast-run state, not a cached old one
-      WALK.targets, WALK.originals = {}, {}
+      pawn:DestroyFollowers(); pawn:RebuidFollowers()
+      WALK.originals, WALK.ground, WALK.team, WALK.afterFight = {}, nil, nil, false
       print("[GamepadTweaks] walking appearance: off (native display restored)\n")
     end
     return
@@ -541,36 +818,48 @@ local function taskWalkAppearance()
     if WALK.followerCount then pawn.FollowerCount = math.max(5, WALK.followerCount) end
     print("[GamepadTweaks] walking appearance: on (speed/effects unchanged)\n")
   end
-  if now() >= WALK.findAt then
-    WALK.findAt, WALK.targets = now() + 0.1, {}
+  do
     local cls = StaticFindObject("/Script/JH.JHPaperFlipbookComponent")
     if not cls or not cls:IsValid() then return end
-    local function add(actor)
+    local heroSprites, present, land = 0, {}, false
+    local function add(actor, hero)
       if not live(actor) then return end
       eachArr(actor:K2_GetComponentsByClass(cls), function(i, sprite)
         if not live(sprite) then return end
-        local known
-        for _, original in ipairs(WALK.originals) do if live(original.sprite) and original.sprite:GetAddress() == sprite:GetAddress() then known = original; break end end
-        if not known then known = { sprite = sprite, auto = sprite.bAutoCalcRunOrIdleState, slots = {},
-          run = sprite.DefaultRunAnimalState, idle = sprite.DefaultIdleAnimalState }; WALK.originals[#WALK.originals + 1] = known end
-        if actor == pawn then WALK.slots(sprite, known.slots, false) end
-        WALK.targets[#WALK.targets + 1] = { actor = actor, sprite = sprite, hero = actor == pawn }
+        local address = sprite:GetAddress()
+        local known = WALK.originals[address]
+        if not known or not live(known.sprite) then known = {sprite = sprite, hero = hero, Idle = {}, Run = {}, FastRun = {}} end
+        present[address] = known
+        if hero then heroSprites = heroSprites + 1 end
+        if sprite.bShipType then WALK.park(sprite, known, false); known.anchor = nil; return end
+        local ground = hero and WALK.feet(pawn, instance)
+        if hero and ground then land = true end
+        if not hero or ground then WALK.slots(sprite, known, ground, false) end
+        if not hero then WALK.rest(actor, sprite, known, clock) end
       end)
     end
-    add(pawn)
-    local heroSprites = #WALK.targets
-    local count = 0
-    eachArr(pawn.FollowCharacters, function(i, actor) if live(actor) then count = count + 1; add(actor) end end)
-    local report = string.format("%s heroSprites=%d followers=%d", lv, heroSprites, count)
-    if report ~= WALK.report then WALK.report = report; print("[GamepadTweaks] walking: " .. report .. "\n") end
-    if count == 0 and now() >= WALK.rebuildAt then
-      WALK.rebuildAt = now() + 2 -- no per-frame spawning; native story/scene guards are kept
+    add(pawn, true)
+    local grounded = land and onGround(pawn)
+    local members = {}
+    local function collect(_, actor)
+      if live(actor) and not actor:IsActorBeingDestroyed() then members[#members + 1] = actor end
+    end
+    eachArr(pawn.FollowCharacters, collect)
+    if #members == 0 and grounded and (clock >= WALK.rebuildAt or WALK.afterFight) then
+      WALK.rebuildAt = clock + 2
       if WALK.bridge then
-        if writeFile("walk_actor.txt", string.format("%x", pawn:GetAddress())) then WALK.bridge(); WALK.findAt = 0 end
+        if writeFile("walk_actor.txt", string.format("%x", pawn:GetAddress())) then WALK.bridge(); eachArr(pawn.FollowCharacters, collect) end
       elseif not WALK.warned then WALK.warned = true; print("[GamepadTweaks] walking followers: bridge missing (old DLL)\n") end
     end
+    if grounded then WALK.formation(pawn, level, members, clock) end
+    for _, actor in ipairs(members) do add(actor) end
+    for address, original in pairs(WALK.originals) do
+      if not present[address] and live(original.sprite) then WALK.slots(original.sprite, original, nil, true) end
+    end
+    WALK.originals = present
+    local report = string.format("%s heroSprites=%d followers=%d", lv, heroSprites, #members)
+    if report ~= WALK.report then WALK.report = report; print("[GamepadTweaks] walking: " .. report .. "\n") end
   end
-  walkApply()
 end
 
 -- ---------------------------------------------------------------- 8) battle detection -> battle.flag
@@ -664,6 +953,65 @@ end
 local reqCache = nil
 local kindCache = {}     -- defId -> { sub, skill }  for books (30-38), materials (40-49), treasures (50-56), quest items (60), recipes (99)
 local baseCache = {}
+local EQUIP = { units = { [1]=80, [2]=80, [3]=91, [4]=91, [7]=1.5, [8]=2, [9]=51, [10]=2.35, [11]=58, [12]=1.9,
+  [14]=80, [15]=57.5, [17]=60, [19]=55, [21]=55, [23]=55, [25]=55, [50]=11, [51]=13, [53]=0.15,
+  [55]=27, [56]=0.33, [57]=0.5, [58]=300, [59]=110, [60]=0.13,
+  [-100001]=5, [-100003]=5, [-100007]=5, [-100009]=5, [-100011]=5, [-100013]=5, [-100015]=5,
+  [-100017]=5, [-100021]=5, [-100023]=6, [-100025]=6, [-100050]=3, [-100054]=5, [-100056]=2,
+  [-100058]=5, [-100060]=2, [-100062]=2, [-100064]=2, [-100066]=4.5, [-100070]=5, [-100072]=2.5,
+  [-100074]=3, [-100316]=6, [-100523]=5, [-100524]=10, [-100554]=4, [-100585]=7, [-100595]=7, [-100600]=7 },
+  standard = { [100050]=100007, [100054]=100001, [100056]=100003, [100058]=100009, [100060]=100011,
+    [100062]=100013, [100064]=100015, [100066]=100017, [100070]=100021, [100072]=100023, [100074]=100025 }, curves = {} }
+function EQUIP.curve(id)
+  if EQUIP.curves[id] == nil then
+    local defs = StaticFindObject("/Game/JH/Tables/Buffs.Buffs")
+    if not live(defs) then return end
+    local row = defs:FindRow(tostring(id))
+    local values = {}
+    if row then
+      for level = 1, 10 do
+        values[level] = math.abs(tonumber(row[level == 1 and "ModifierValue" or "ModifierValue" .. (level - 1)]) or 0)
+      end
+      while #values > 0 and values[#values] == 0 do values[#values] = nil end
+    end
+    EQUIP.curves[id] = #values > 0 and values or false
+  end
+  return EQUIP.curves[id]
+end
+function EQUIP.effect(id, level)
+  local standard = EQUIP.standard[id] or id
+  if level == 0 then return -standard, 0 end
+  local scale = EQUIP.units[-standard] or 1
+  local function magnitude(curve, at)
+    at = math.max(1, math.min(#curve, at))
+    local index = math.floor(at)
+    return curve[index] + (at - index) * ((curve[index + 1] or curve[index]) - curve[index])
+  end
+  local curve = EQUIP.curve(id)
+  local reference = curve and (id == standard and curve or EQUIP.curve(standard))
+  local typical = reference and magnitude(reference, scale)
+  if typical and typical > 0 then
+    return -standard, (level < 0 and -1 or 1) * magnitude(curve, math.abs(level)) / typical
+  end
+  return -id, level / (EQUIP.units[-id] or 1)
+end
+function EQUIP.read(profile, actions, source, base)
+  eachArr(actions, function(_, action)
+    local kind, id, amount = tonumber(action.Type), tonumber(action.ID), tonumber(action.Num)
+    if (kind ~= 4 and kind ~= 5) or not id or id <= 0 or not amount or amount == 0 then return end
+    local key = kind == 4 and id or -id
+    if kind == 4 and (id == 53 or id == 69) then amount = -amount end
+    profile.values[key] = (profile.values[key] or 0) + amount
+    if amount > 0 and (source == "roll" or source == "base" and kind == 5 or source == "extra" and not base.values[key]) then
+      profile.affixes = profile.affixes + 1
+    end
+  end)
+end
+function EQUIP.base(actions)
+  local profile = {values = {}, affixes = 0}
+  EQUIP.read(profile, actions, "base")
+  return profile
+end
 local weaponLimits = nil -- NPCs.WeaponLimits, not the character's currently equipped weapon
 local function buildWeaponLimits()
   weaponLimits = {}
@@ -676,17 +1024,15 @@ local function buildWeaponLimits()
   end)
 end
 local function buildReqCache()
-  reqCache = {}
   local dt = StaticFindObject("/Game/JH/Tables/Items.Items"); if not dt or not dt:IsValid() then return end
+  reqCache = {}
   dt:ForEachRow(function(name, row)
     local t = row.ItemType
     if t >= 1 and t <= 13 then
       local list = {}
       row.Requirements:ForEach(function(i, e) local r = e:get(); list[#list + 1] = { t = r.Type, id = r.ID } end)
       reqCache[row.ID] = { sub = t, req = list }
-      local b = {}
-      row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 4 then b[a.ID] = (b[a.ID] or 0) + a.Num end end)
-      baseCache[row.ID] = b
+      baseCache[row.ID] = EQUIP.base(row.Actions)
     elseif (t >= 30 and t <= 38) or (t >= 40 and t <= 56) or t == 60 or t == 99 then
       local sk = nil
       row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 10 and not sk then sk = a.ID end end)
@@ -712,39 +1058,40 @@ local function canUse(defId, npc)
   return true
 end
 local function slotOf(sub) if sub >= 1 and sub <= 6 then return "W" end if sub >= 10 and sub <= 13 then return sub end return nil end
--- final stats = base stats from the Items table + the per-item rolled bonus (what the tooltip shows,
--- e.g. 亮银甲 44.2 + 3 = 47 防御力). v4.3 only summed the rolled bonus and missed the base.
-local function baseStats(defId)
-  local b = baseCache[defId]; if b then return b end
-  b = {}
-  local dt = StaticFindObject("/Game/JH/Tables/Items.Items")
-  if dt and dt:IsValid() then
-    dt:ForEachRow(function(name, row)
-      if row.ID == defId then row.Actions:ForEach(function(i, e) local a = e:get(); if a.Type == 4 then b[a.ID] = (b[a.ID] or 0) + a.Num end end) end
-    end)
-  end
-  baseCache[defId] = b
-  return b
-end
 local function statsOf(sp)
-  local t = {}
-  for k, v in pairs(baseStats(sp.ItemDefId)) do t[k] = v end
-  for _, arr in ipairs({ sp.Actions, sp.RandActions }) do
-    eachArr(arr, function(i, a) if a.Type == 4 then t[a.ID] = (t[a.ID] or 0) + a.Num end end)
+  local base = baseCache[sp.ItemDefId]; if not base then return end
+  local profile = {values = {}, affixes = base.affixes}
+  for key, amount in pairs(base.values) do profile.values[key] = amount end
+  EQUIP.read(profile, sp.Actions, "extra", base)
+  EQUIP.read(profile, sp.RandActions, "roll", base)
+  local totals = {}
+  for key, amount in pairs(profile.values) do
+    local effect, value = key, amount
+    if key < 0 then effect, value = EQUIP.effect(-key, amount) end
+    totals[effect] = (totals[effect] or 0) + value
   end
-  return t
+  profile.values = totals
+  local score = 0.5 * profile.affixes
+  for key, amount in pairs(profile.values) do
+    local points
+    if key < 0 then points = 0.65 * (amount < 0 and -1 or 1) * math.log(1 + math.abs(amount), 2)
+    else
+      points = amount / (EQUIP.units[key] or 1)
+      if key == 56 or key == 57 then points = points * 0.25 end
+    end
+    score = score + points
+  end
+  profile.score = score
+  return profile
 end
 local function better(new, old, mode)
-  local keys = {}
-  for k in pairs(new) do keys[k] = true end; for k in pairs(old) do keys[k] = true end
-  local up, down, score = false, false, 0
-  for k in pairs(keys) do
-    local a, b = new[k] or 0, old[k] or 0
-    if a > b + 1e-4 then up = true elseif a < b - 1e-4 then down = true end
-    local m = math.max(math.abs(a), math.abs(b)); if m > 1e-6 then score = score + (a - b) / m end
-  end
-  if mode == 1 then return score > 0.05 end    -- "sum": net relative gain
-  return up and not down                        -- "strict": nothing lower, something higher
+  if not new then return false end
+  if not old then return new.score > 1e-4 end
+  if mode == 1 then return new.score > old.score + 1e-4 end
+  if new.affixes < old.affixes then return false end
+  for key, amount in pairs(old.values) do if (new.values[key] or 0) < amount - 1e-4 then return false end end
+  for key, amount in pairs(new.values) do if amount < (old.values[key] or 0) - 1e-4 then return false end end
+  return new.score > old.score + 1e-4
 end
 
 local function teamNpcFromJson(js)
@@ -758,41 +1105,143 @@ local function teamNpcFromJson(js)
   end
   return -1                    -- unknown focus: do not filter as if the hero were selected
 end
-local function focusedNpc()
-  local ov = readFirst("npc_override.txt"); if ov and tonumber(ov) then return tonumber(ov) end
-  for _, v in ipairs(FindAllOf("TeamModuleVM") or {}) do
-    if live(v) then return teamNpcFromJson(v.RootData:DataToString():ToString()) end
-  end
-  return -1
-end
-local function wornStats(npc)
+local function wornStats(npc, view)
   local res = {}
-  local mgr = nil; for _, m in ipairs(FindAllOf("NPCManager") or {}) do if live(m) then mgr = m end end
-  if not mgr then return res end
-  local info = mgr:GetNPCInfo(npc, false); if not info or not info:IsValid() then return res end
+  local instance = view:GetOuter()
+  local mgr
+  for _, candidate in ipairs(FindAllOf("NPCManager") or {}) do
+    if live(candidate) and live(instance) then
+      local owner = candidate:GetOuter()
+      if live(owner) and owner:GetAddress() == instance:GetAddress() then mgr = candidate; break end
+    end
+  end
+  if not mgr then return end
+  local info = mgr:GetNPCInfo(npc, false); if not info or not info:IsValid() then return end
+  local complete = true
   info.EquipmentSpecs:ForEach(function(i, e)
     local sp = e:get()
-    if sp and sp:IsValid() then local ent = reqCache[sp.ItemDefId]; local s = ent and slotOf(ent.sub); if s then res[s] = statsOf(sp); if s == "W" then res.wsub = ent.sub end end end
+    if live(sp) and not sp.bOnlyForLayout and sp.ItemDefId > 0 then
+      local ent = reqCache[sp.ItemDefId]; local slot = ent and slotOf(ent.sub)
+      if not ent then complete = false
+      elseif slot then res[slot] = statsOf(sp); if not res[slot] then complete = false end; if slot == "W" then res.wsub = ent.sub end end
+    end
   end)
-  return res
+  if complete then return res end
 end
-local function gridItems(grid)
+local function gridItems(grid, displayed)
   local out = {}
-  local items = grid:GetListItems()
+  local items
+  if displayed then items = grid:GetDisplayedEntryWidgets() else items = grid:GetListItems() end
   if type(items) == "table" then for _, sp in ipairs(items) do if type(sp) == "userdata" and sp.get and not sp.IsValid then sp = sp:get() end out[#out + 1] = sp end
   elseif items and items.ForEach then items:ForEach(function(i, e) out[#out + 1] = e:get() end) end
   return out
 end
 
+local BAG = { hidden = {}, filtered = {}, observing = false }
+function BAG.same(first, second)
+  return first and second and first:IsValid() and second:IsValid() and first:GetAddress() == second:GetAddress()
+end
+function BAG.owner(vm, rootClass)
+  local parent = vm
+  for depth = 1, 8 do
+    if not live(parent) then return end
+    local view = parent:GetPairView()
+    if live(view) and view:GetClass():GetFName():ToString() == rootClass then return parent end
+    parent = parent:GetParentModule()
+  end
+end
+function BAG.belongs(vm, root)
+  for depth = 1, 8 do
+    if not live(vm) then return false end
+    if BAG.same(vm, root) then return true end
+    vm = vm:GetParentModule()
+  end
+  return false
+end
+function BAG.rebuild(vm, grid)
+  local address = grid:GetAddress()
+  vm:HandleBackpackBatchChange()
+  BAG.filtered[address] = nil
+end
+function BAG.observe(view)
+  BAG.observing = true
+  local root = view:GetNeoUIVM()
+  local backpack = live(root) and root:GetSubModuleByKey(FName("Backpack"))
+  local panel = live(backpack) and backpack:GetPairView()
+  local grid = live(panel) and panel.GRID_ITEM
+  BAG.observedGrid = live(grid) and grid or nil
+  if BAG.observedGrid then
+    local address = grid:GetAddress()
+    if BAG.same(BAG.filtered[address], grid) and BAG.same(root:GetPairView(), view)
+      and BAG.same(panel:GetNeoUIVM(), backpack) and BAG.belongs(backpack, root)
+      and backpack:GetModuleVisibility() and shownChain(grid, {}, 0) then
+      BAG.rebuild(backpack, grid)
+    end
+  end
+  return root, panel, BAG.observedGrid
+end
+function BAG.remove(grid, item)
+  if BAG.same(grid, BAG.observedGrid) then return false end
+  grid:RemoveItem(item)
+  local address = grid:GetAddress()
+  if not BAG.same(BAG.filtered[address], grid) then
+    for key, previous in pairs(BAG.filtered) do if not previous:IsValid() then BAG.filtered[key] = nil end end
+    BAG.filtered[address] = grid
+  end
+  return true
+end
+function BAG.panel(vm, root, memo)
+  if not live(vm) or not live(root) or not vm:GetModuleVisibility() or not root:GetModuleVisibility() then return end
+  local view, rootView = vm:GetPairView(), root:GetPairView()
+  if not live(view) or not live(rootView) or not BAG.same(view:GetNeoUIVM(), vm) or not BAG.belongs(vm, root) then return end
+  local grid = view.GRID_ITEM
+  if BAG.observing and (BAG.same(grid, BAG.observedGrid) or rootView:GetClass():GetFName():ToString() == "BPMV_PrimeTeam_C") then return end
+  if live(grid) and shownChain(rootView, memo, 0) and shownChain(grid, memo, 0) then return view, grid end
+end
+function BAG.bound(ctx, grid)
+  if not grid or not BAG.same(ctx.grid, grid) then return false end
+  local view, currentGrid = BAG.panel(ctx.vm, ctx.root, {})
+  return BAG.same(view, ctx.view) and BAG.same(currentGrid, grid)
+end
+function BAG.find(class, rootClass, memo)
+  for _, vm in ipairs(FindAllOf(class) or {}) do
+    if live(vm) and vm:GetModuleVisibility() then
+      local root = BAG.owner(vm, rootClass)
+      local view, grid = BAG.panel(vm, root, memo)
+      if grid then return vm, root, view, grid end
+    end
+  end
+end
+function BAG.opacity(ctx, entry, hidden)
+  local key = entry:GetAddress()
+  local old = BAG.hidden[key]
+  if old and not BAG.same(old.entry, entry) then BAG.hidden[key], old = nil, nil end
+  if hidden then
+    if not old then BAG.hidden[key] = {entry = entry, opacity = entry:GetRenderOpacity(), owner = ctx} end
+    entry:SetRenderOpacity(0)
+  elseif old then
+    BAG.hidden[key] = nil
+    if entry:GetRenderOpacity() == 0 then entry:SetRenderOpacity(old.opacity) end
+  end
+end
+function BAG.release(ctx)
+  for key, old in pairs(BAG.hidden) do
+    if old.owner == ctx then
+      if live(old.entry) then BAG.opacity(ctx, old.entry, false) else BAG.hidden[key] = nil end
+    end
+  end
+  ctx.vm, ctx.root, ctx.view, ctx.grid = nil, nil, nil, nil
+end
+
 -- Gift eligibility is receiver-specific, not the ordinary backpack's weapon/learnability cache.
 local ensureCellHook
-local GIFT = { vm = nil, grid = nil, addr = nil, npc = -1, favor = nil, nextRead = 0, enabled = true,
-  bridge = package.loadlib(DLLPATH, "wsmod_gift_context"), defs = {}, gone = {}, warned = false, hobbies = nil }
+local GIFT = { npc = -1, nextRead = 0, enabled = true,
+  bridge = package.loadlib(DLLPATH, "wsmod_gift_context"), defs = {}, warned = false }
 local function giftHidden(sp)
   if not GIFT.enabled or not live(sp) then return false end
+  if sp.bIsLocked or sp.bOnlyForLayout then return true end
   local id = sp.ItemDefId
   if not id or id <= 0 then return false end
-  if sp.bIsLocked or sp.bOnlyForLayout then return true end
   local def = GIFT.defs[id]
   if not def then
     local ok, d = pcall(function() return sp:GetDef() end)
@@ -813,41 +1262,25 @@ local function giftItemKey(sp)
   local ok, id = pcall(function() return sp:GetId():ToString() end)
   return ok and id or tostring(sp.ItemDefId)
 end
-local function giftEntryInit(self, item, widget)
-  if not GIFT.addr then return end
-  local g, sp, en = self:get(), item:get(), widget:get()
-  if live(g) and g:GetAddress() == GIFT.addr and live(en) then en:SetRenderOpacity(giftHidden(sp) and 0 or 1) end
-end
 local function giftFilter()
-  local grid = GIFT.grid; if not live(grid) then return end
-  local gone = {}
+  local grid = GIFT.grid; if not GIFT.enabled or not BAG.bound(GIFT, grid) then return end
   for _, sp in ipairs(gridItems(grid)) do
-    if live(sp) and giftHidden(sp) then gone[sp:GetAddress()] = true; grid:RemoveItem(sp) end
+    if giftHidden(sp) then BAG.remove(grid, sp) end
   end
-  GIFT.gone = gone
-  for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_Gift_C") or {}) do
-    if live(en) then
-      local sp = en:GetBindedDataObj()
-      if live(sp) then en:SetRenderOpacity((gone[sp:GetAddress()] or giftHidden(sp)) and 0 or 1) end
-    end
-  end
+end
+function GIFT.close()
+  BAG.release(GIFT)
+  GIFT.npc, GIFT.favor, GIFT.hobbies, GIFT.hobbySig, GIFT.nextRead = -1, nil, nil, nil, 0
 end
 local function taskGift()
-  if not stableWorld() or inFight then GIFT.vm, GIFT.grid, GIFT.addr = nil, nil, nil; return end
+  if not stableWorld() or inFight then if GIFT.vm then GIFT.close() end; return end
   local vm = GIFT.vm
-  if not live(vm) or not vm:GetModuleVisibility() then
-    vm = nil
-    for _, v in ipairs(FindAllOf("JHMainCharacterGiftBackpackVM") or {}) do
-      if live(v) and v:GetModuleVisibility() then vm = v; break end
-    end
-  end
-  if not vm then GIFT.vm, GIFT.grid, GIFT.addr, GIFT.favor = nil, nil, nil, nil; return end
-  ensureCellHook()
-  local opened = not GIFT.vm or GIFT.vm:GetAddress() ~= vm:GetAddress()
+  local opened = not BAG.bound(GIFT, GIFT.grid)
   if opened then
-    local view = vm:GetPairView(); if not live(view) or not live(view.GRID_ITEM) then return end
-    GIFT.vm, GIFT.grid, GIFT.addr = vm, view.GRID_ITEM, view.GRID_ITEM:GetAddress()
-    GIFT.npc, GIFT.favor, GIFT.nextRead = -1, nil, 0
+    if vm then GIFT.close() end
+    GIFT.vm, GIFT.root, GIFT.view, GIFT.grid = BAG.find("JHMainCharacterGiftBackpackVM", "BPMV_Gift_C", {})
+    vm = GIFT.vm; if not vm then return end
+    ensureCellHook()
   end
   if now() >= GIFT.nextRead then
     GIFT.nextRead = now() + 0.5
@@ -884,22 +1317,31 @@ local function taskGift()
       -- Recompute is_fav through the game's receiver-aware converter. Keep the selected item if still available.
       local selected = GIFT.grid:GetSelectedItem(); local key = giftItemKey(selected)
       local index = live(selected) and GIFT.grid:GetIndexForItem(selected) or 0
-      vm:HandleBackpackBatchChange(); giftFilter()
+      BAG.rebuild(vm, GIFT.grid)
+      if not BAG.bound(GIFT, GIFT.grid) then GIFT.close(); return end
+      giftFilter()
       local items = gridItems(GIFT.grid); local pick = nil
       if key then for _, sp in ipairs(items) do if live(sp) and giftItemKey(sp) == key then pick = sp; break end end end
       if not pick and #items > 0 then pick = items[math.min(math.max((index or 0) + 1, 1), #items)] end
       if pick then GIFT.grid:SetSelectedItem(pick) end
+      return
     end
   end
   giftFilter() -- game-driven sort/filter/item changes are filtered too; no address-keyed eligibility cache
 end
 
 local bp = { open = false, sortDone = false, openAt = 0, npc = nil, filter = nil, lit = {} }
+function BAG.clearMark(key)
+  local entry = bp.lit[key]
+  bp.lit[key] = nil
+  if not live(entry) then return end
+  local frame = entry.ItemDisplay.CMP.IMG_Focus
+  frame:SetColorAndOpacity(WHITE)
+  local focused = entry:IsHovered() or entry:HasFocusedDescendants()
+  if not focused then frame:SetVisibility(2) end
+end
 local function resetEntries()
-  for addr, en in pairs(bp.lit) do
-    pcall(function() if en:IsValid() then local f = en.ItemDisplay.CMP.IMG_Focus; f:SetColorAndOpacity(WHITE); f:SetVisibility(2) end end)
-  end
-  bp.lit = {}
+  for key in pairs(bp.lit) do pcall(BAG.clearMark, key) end
 end
 
 -- ================================================================ hide pipeline (no flash)
@@ -912,10 +1354,10 @@ end
 -- "u" = unusable by that character: hidden in every tab
 -- "a" = belongs to its own category (learned manual / learned recipe / quest item / material): hidden in 全部 only
 local HOOK_FN = "/Game/JH/JHNeoUI/Modules/Shared/Backpack/Comps/Grid/BP_ItemGridWDT.BP_ItemGridWDT_C:BP_OnEntryInitialized_Event_0"
-local HIDE = { vm = nil, findAt = 0, open = false, view = nil, grid = nil, gridAddr = nil, vn = nil, team = nil, btns = {},
+local HIDE = { findAt = 0, open = false,
   hooked = false, hookCount = 0, lastHook = 0, sig = nil, recheckAt = nil, removed = 0, lastNpc = nil, lastFilter = nil,
   memo = {}, info = {}, wtype = {}, dim = {}, dimWt = {}, recipeDone = {}, bookDone = {}, srcN = -1, cfgHide = true, cfgTidy = true,
-  cacheAt = -1, cacheNpc = 0, cacheFilter = -1 }
+  cacheAt = -1, cacheNpc = -1, cacheFilter = -1 }
 
 -- 学成 manuals: the cell's display data says "is_acquired":true (the game's 学成 mark). This is not the same as
 -- "the focused character knows the skill" (HasSkillById): most 学成 books are known by nobody in the team.
@@ -949,7 +1391,7 @@ local function weaponType(npc)
 end
 local function teamNpcs()
   local out = {}
-  local tv = HIDE.team
+  local tv = HIDE.root
   if tv and tv:IsValid() then
     local js = tv.RootData:DataToString():ToString()
     for blk in js:gmatch('{[^{}]-"index":%d+[^{}]-}') do
@@ -992,31 +1434,14 @@ local function isHidden(npc, filter, defId)
   if d == "a" then return HIDE.cfgTidy and filter == 0 end
   return false
 end
-local function observeNpcFromJson(js)
-  local found = nil
-  for id in js:gmatch('"npc_id"%s*:%s*(%-?%d+)') do
-    id = tonumber(id)
-    if found ~= nil and found ~= id then return -1 end
-    found = id
-  end
-  return found or -1 -- never substitute the team tab's selected NPC for the observed character
-end
-local function observeGreyWeapon(npc, defId, js)
-  if npc >= 0 or not HIDE.context or not HIDE.cfgHide then return false end
-  local e = reqCache[defId]
-  -- Only the active observed grid's current, ID-matched display data; never learn equipment greyness.
-  return e and e.sub >= 1 and e.sub <= 6 and js:find('"not_learnable":true', 1, true) ~= nil or false
-end
 -- current character / tab, re-read at most once per 3 ms (one read per batch of cells)
 local function current()
   local t = os.clock()
   if t - HIDE.cacheAt > 0.003 then
     HIDE.cacheAt = t
     local npc = -1
-    local tv = HIDE.team
-    if HIDE.context and live(HIDE.context) then
-      npc = observeNpcFromJson(HIDE.context.RootData:DataToString():ToString())
-    elseif tv and tv:IsValid() then npc = teamNpcFromJson(tv.RootData:DataToString():ToString()) end
+    local tv = HIDE.root
+    if live(tv) and live(tv.RootData) then npc = teamNpcFromJson(tv.RootData:DataToString():ToString()) end
     if t - (HIDE.ovAt or -1) > 0.5 then HIDE.ovAt = t; local ov = readFirst("npc_override.txt"); HIDE.ov = ov and tonumber(ov) or nil end
     if HIDE.ov then npc = HIDE.ov end
     -- active tab = vm:GetFilterIndex() (EBackpackFilterType_Console: 0 全部 1 武器 2 防具 3 丹药 4 秘籍 5 材料 6 珍宝 7 任务).
@@ -1034,14 +1459,19 @@ local function current()
   return HIDE.cacheNpc, HIDE.cacheFilter
 end
 local function onEntryInit(self, item, widget)
-  if not HIDE.open or not HIDE.gridAddr then return end
-  local g = self:get(); if not g or not g:IsValid() or g:GetAddress() ~= HIDE.gridAddr then return end
-  local sp, w = item:get(), widget:get()
-  if not sp or not sp:IsValid() or not w or not w:IsValid() then return end
-  HIDE.hookCount = HIDE.hookCount + 1
-  local hid = false
-  if not sp.bOnlyForLayout then local npc, filter = current(); hid = isHidden(npc, filter, sp.ItemDefId) end
-  w:SetRenderOpacity(hid and 0 or 1)
+  local grid, spec, entry = self:get(), item:get(), widget:get()
+  if not live(entry) then return end
+  local key = entry:GetAddress()
+  if BAG.hidden[key] then BAG.opacity(nil, entry, false) end
+  if bp.lit[key] then pcall(BAG.clearMark, key) end
+  if not live(spec) then return end
+  if BAG.bound(GIFT, grid) then
+    BAG.opacity(GIFT, entry, giftHidden(spec))
+  elseif HIDE.open and BAG.bound(HIDE, grid) then
+    HIDE.hookCount = HIDE.hookCount + 1
+    local npc, filter = current()
+    BAG.opacity(HIDE, entry, not spec.bOnlyForLayout and isHidden(npc, filter, spec.ItemDefId))
+  end
 end
 ensureCellHook = function()
   if HIDE.hooked or iniNumber("cell_hook", 1) ~= 1 then return end
@@ -1049,23 +1479,19 @@ ensureCellHook = function()
   local ok, err = pcall(function()
     RegisterHook(HOOK_FN, function(self, item, widget)
       pcall(onEntryInit, self, item, widget)
-      pcall(giftEntryInit, self, item, widget)
     end)
   end)
   HIDE.hooked = ok
   print("[GamepadTweaks] backpack/gift: cell hook " .. (ok and "registered" or ("failed: " .. tostring(err))) .. "\n")
 end
 local function onOpen(vm)
-  local view = vm:GetPairView(); if not view or not view:IsValid() then return false end
-  HIDE.view, HIDE.grid, HIDE.vn = view, view.GRID_ITEM, view:GetFName():ToString()
-  HIDE.gridAddr = HIDE.grid:GetAddress()
-  HIDE.team = nil
-  if not HIDE.context then for _, v in ipairs(FindAllOf("TeamModuleVM") or {}) do if live(v) then HIDE.team = v end end end
-  HIDE.btns = {}
-  for _, b in ipairs(FindAllOf("BP_BackpackFilterBtn_C") or {}) do
-    if live(b) and b:GetFullName():find(HIDE.vn, 1, true) then local n = b:GetFName():ToString(); HIDE.btns[#HIDE.btns + 1] = { obj = b, name = n, all = (n == "Btn_All") } end
-  end
   if not reqCache then buildReqCache() end
+  if not reqCache then return false end
+  local grid = HIDE.grid
+  if BAG.same(BAG.filtered[grid:GetAddress()], grid) then
+    BAG.rebuild(vm, grid)
+    if not BAG.bound(HIDE, grid) then return false end
+  end
   HIDE.cfgHide = iniNumber("hide_unusable", 1) == 1
   HIDE.cfgTidy = iniNumber("tidy_all_tab", 1) == 1
   HIDE.memo, HIDE.info, HIDE.wtype = {}, {}, {}
@@ -1075,7 +1501,7 @@ local function onOpen(vm)
   local t0 = os.clock()
   local ids = {}
   vm.CurrentDataSrc:ForEach(function(i, e) ids[e:get().ItemDefId] = true end)
-  local npcs = HIDE.context and { (current()) } or teamNpcs()
+  local npcs = teamNpcs()
   for _, npc in ipairs(npcs) do
     if npc >= 0 then
       local wt = weaponType(npc)
@@ -1089,38 +1515,16 @@ local function onOpen(vm)
   return true
 end
 local function taskHide()
-  if inFight then HIDE.open = false return end
-  local vm = HIDE.vm
-  local visible = live(vm) and vm:GetModuleVisibility()
-  if not visible and now() < HIDE.findAt then HIDE.open = false; return end
-  if not visible or now() >= HIDE.findAt then
+  local paused = BAG.observing or inFight or now() < pauseUntil
+  if paused or not BAG.bound(HIDE, HIDE.grid) then
+    if HIDE.vm then BAG.release(HIDE); HIDE.open = false; resetEntries(); bp.open = false end
+    if paused or now() < HIDE.findAt then return end
     HIDE.findAt = now() + 0.25
-    local picked, context = nil, nil
-    for _, view in ipairs(FindAllOf("BPMV_Observe_C") or {}) do
-      if live(view) and view:IsVisible() then
-        local parent = view:GetNeoUIVM()
-        if live(parent) then
-          local child = parent:GetSubModuleByKey(FName("Backpack"))
-          if live(child) and child:GetModuleVisibility() then picked, context = child, parent; break end
-        end
-      end
-    end
-    if not picked then
-      for _, v in ipairs(FindAllOf("JHMainCharacterBackpackInTeamVM") or {}) do
-        if live(v) and v:GetModuleVisibility() then picked = v; break end
-      end
-    end
-    if not picked then HIDE.open, HIDE.vm, HIDE.context = false, nil, nil; return end
-    if not live(vm) or vm:GetAddress() ~= picked:GetAddress() then HIDE.open = false end
-    vm, HIDE.vm, HIDE.context = picked, picked, context
+    HIDE.vm, HIDE.root, HIDE.view, HIDE.grid = BAG.find("JHMainCharacterBackpackInTeamVM", "BPMV_PrimeTeam_C", {})
+    if not HIDE.vm then return end
   end
-  if not vm:GetModuleVisibility() then HIDE.open = false return end
-  if not HIDE.open then
-    if now() < pauseUntil then return end
-    if not onOpen(vm) then return end
-    HIDE.open = true
-  end
-  local grid = HIDE.grid; if not grid or not grid:IsValid() then HIDE.open = false return end
+  local vm, grid = HIDE.vm, HIDE.grid
+  if not HIDE.open then HIDE.open = onOpen(vm); if not HIDE.open then return end end
   -- inventory changed (item used, equipped, learned): decisions may change
   local srcN = vm.CurrentDataSrc:GetArrayNum()
   if srcN ~= HIDE.srcN then HIDE.srcN = srcN; HIDE.memo = {}; HIDE.wtype = {} end
@@ -1130,19 +1534,22 @@ local function taskHide()
   if sig == HIDE.sig and not recheck then return end
   if recheck then HIDE.recheckAt = nil end
   -- character switched while we had items removed: bring them back now and filter in this same tick
-  if HIDE.lastNpc ~= nil and npc ~= HIDE.lastNpc and HIDE.removed > 0 then vm:HandleBackpackBatchChange(); HIDE.removed = 0 end
+  if HIDE.lastNpc ~= nil and npc ~= HIDE.lastNpc and HIDE.removed > 0 then
+    BAG.rebuild(vm, grid); HIDE.removed = 0
+    if not BAG.bound(HIDE, grid) then return end
+  end
   if HIDE.lastFilter ~= nil and filter ~= HIDE.lastFilter then HIDE.removed = 0 end      -- the game rebuilt the list itself
   HIDE.lastNpc, HIDE.lastFilter = npc, filter
   local gone, n = {}, 0
   for _, sp in ipairs(gridItems(grid)) do
-    if sp:IsValid() and not sp.bOnlyForLayout and isHidden(npc, filter, sp.ItemDefId) then
-      grid:RemoveItem(sp); gone[sp:GetAddress()] = true; n = n + 1
+    if sp:IsValid() and not sp.bOnlyForLayout and isHidden(npc, filter, sp.ItemDefId) and BAG.remove(grid, sp) then
+      gone[sp:GetAddress()] = true; n = n + 1
     end
   end
   -- learn from what the game itself shows (greyed out / recipe learned) and repair recycled cells
   local learnt = 0
-  for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
-    if live(en) and en:GetFullName():find(HIDE.vn, 1, true) then
+  for _, en in ipairs(gridItems(grid, true)) do
+    if live(en) then
       local ok, sp = pcall(function() return en:GetBindedDataObj() end)
       if ok and sp and sp:IsValid() and not sp.bOnlyForLayout then
         local addr = sp:GetAddress()
@@ -1150,7 +1557,6 @@ local function taskHide()
         local sid = tonumber(js:match('"setting_id":(%d+)'))
         if sid == sp.ItemDefId and not gone[addr] then
           local newly = false
-          if observeGreyWeapon(npc, sid, js) then grid:RemoveItem(sp); gone[addr] = true; learnt = learnt + 1 end
           if npc >= 0 and not reqCache[sid] and js:find('"not_learnable":true', 1, true) and decide(npc, sid) == false then
             HIDE.dim[npc] = HIDE.dim[npc] or {}; HIDE.dim[npc][sid] = true; HIDE.memo[npc][sid] = "u"; newly = true
           elseif js:find('"is_recipe":true', 1, true) and js:find('"is_acquired":true', 1, true) and not HIDE.recipeDone[sid] then
@@ -1161,11 +1567,9 @@ local function taskHide()
               HIDE.bookDone[sid] = true; for _, mm in pairs(HIDE.memo) do mm[sid] = nil end; newly = true; saveBooks()
             end
           end
-          if newly and isHidden(npc, filter, sid) then grid:RemoveItem(sp); gone[addr] = true; learnt = learnt + 1 end
+          if newly and isHidden(npc, filter, sid) and BAG.remove(grid, sp) then gone[addr] = true; learnt = learnt + 1 end
         end
-        local want = gone[addr] and 0 or 1
-        local ok2, op = pcall(function() return en:GetRenderOpacity() end)
-        if ok2 and math.abs(op - want) > 0.01 then en:SetRenderOpacity(want) end
+        BAG.opacity(HIDE, en, gone[addr] or isHidden(npc, filter, sp.ItemDefId))
       end
     end
   end
@@ -1178,16 +1582,13 @@ end
 
 -- ================================================================ sort on open + highlight (slow, 200 ms)
 local function taskBackpack()
-  if inFight or not stableWorld() then if bp.open then resetEntries(); bp.open = false end return end
-  local vm = HIDE.vm
-  if not (vm and vm:IsValid()) then vm = nil; for _, v in ipairs(FindAllOf("JHMainCharacterBackpackInTeamVM") or {}) do if live(v) then vm = v end end end
-  local shown = vm and vm:GetModuleVisibility()
-  if not shown then if bp.open then resetEntries(); bp.open = false end return end
-  local view = vm:GetPairView(); if not view or not view:IsValid() then return end
-  if not reqCache then buildReqCache() end
+  if inFight or not HIDE.open or not stableWorld() or not BAG.bound(HIDE, HIDE.grid) then
+    if bp.open then resetEntries(); bp.open = false end; return
+  end
+  local vm, view = HIDE.vm, HIDE.view
   local cfgSort = iniNumber("default_sort", 4)
   local mark = iniNumber("highlight_better", 1) == 1
-  local mode = iniNumber("better_mode", 0)
+  local mode = iniNumber("better_mode", 1)
 
   if not bp.open then bp.open = true; bp.sortDone = false; bp.openAt = now(); bp.npc = nil; bp.filter = nil end
   -- 1) sort once per opening (after the panel has had a moment to build); taskHide runs right after in the
@@ -1210,39 +1611,37 @@ local function taskBackpack()
     end
   end
   -- 2) highlight better equipment on the visible entries
-  local npc = focusedNpc()
+  local npc = current()
   if npc < 0 then resetEntries(); return end
   if bp.npc ~= nil and npc ~= bp.npc then resetEntries() end
   bp.npc = npc
   if not mark then if next(bp.lit) then resetEntries() end return end
-  local worn = wornStats(npc)
-  local viewName = view:GetFName():ToString()
-  for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
-    if live(en) and en:GetFullName():find(viewName, 1, true) then
+  local worn = wornStats(npc, view)
+  if not worn then resetEntries(); return end
+  local visible = {}
+  for _, en in ipairs(gridItems(HIDE.grid, true)) do
+    if live(en) then
       local key = en:GetAddress()
+      visible[key] = true
       local good = false
-      local ok, sp = pcall(function() local d = en.BindedDataObject; if d and d.Get then d = d:Get() end; return d end)
-      if ok and sp and sp:IsValid() and not sp.bOnlyForLayout then
+      local sp = en:GetBindedDataObj()
+      if live(sp) and not sp.bOnlyForLayout then
         local ent = reqCache[sp.ItemDefId]
         local slot = ent and slotOf(ent.sub)
         -- weapons: only compare against the same weapon type the character is holding
         if slot and canUse(sp.ItemDefId, npc) and not (slot == "W" and worn.wsub and worn.wsub ~= ent.sub and iniNumber("same_weapon_type", 1) == 1) then
-          good = better(statsOf(sp), worn[slot] or {}, mode)
+          good = better(statsOf(sp), worn[slot], mode)
         end
       end
       local f = en.ItemDisplay.CMP.IMG_Focus
       if good then
         f:SetColorAndOpacity(highlightColor()); if f:GetVisibility() ~= 3 then f:SetVisibility(3) end
         bp.lit[key] = en
-      elseif bp.lit[key] or f.ColorAndOpacity.G < 0.99 then
-        f:SetColorAndOpacity(WHITE)
-        local focused = false
-        pcall(function() focused = en.BTN_JHItem.BtnMain:IsHovered() or en.JHGPCBtn_ActiveBG:IsVisible() end)
-        if not focused then f:SetVisibility(2) end
-        bp.lit[key] = nil
+      elseif bp.lit[key] then BAG.clearMark(key)
       end
     end
   end
+  for key in pairs(bp.lit) do if not visible[key] then BAG.clearMark(key) end end
 end
 
 -- ---------------------------------------------------------------- 10) character screen: skip 属性 / 装备 for the gamepad
@@ -1273,6 +1672,15 @@ local NAV_VIEWS = { { "SideBar", "BPMV_TeamSideBar2_C" }, { "Property", "BPMV_Te
 local NAV_BTNS = { "BTN_FormatonOut", "BTN_QieCuo", "BTN_SongLi", "BTN_LiDui", "BTN_QingJiao", "BTN_MountPet" }   -- left to right
 local NAV_ORDER = { "SideBar", "Backpack", "Bottom" }
 local NAV_IDX = { SideBar = 1, Backpack = 2, Bottom = 3 }
+function NAV.pad(view)
+  if not live(view) then return false end
+  local ok, pad = pcall(function() return view:BP_IsGamepadMode() end)
+  return ok and pad == true
+end
+function NAV.shown(class)
+  local memo = {}
+  for _, view in ipairs(FindAllOf(class) or {}) do if live(view) and shownChain(view, memo, 0) then return view end end
+end
 local function navRegion()
   for _, e in ipairs(NAV.views) do
     local v = e[2]
@@ -1334,11 +1742,13 @@ local function navHook()
   NAV.hooked = true
   local ok, e = pcall(function()
     RegisterHook("/Script/NeoUI.NeoUIUniversalModuleVMBase:ChangeNaviFocus", function(self, id, scen, str)
-      if NAV.self then return end
-      if OBS_HOOK and OBS_HOOK(self, id) then return end
-      if not NAV.open or not NAV.cfg then return end
+      if NAV.self or tonumber(scen:get()) ~= 3 then return end
       local key = id:get():ToString()
       if key ~= "Property" and key ~= "Equip" then return end
+      local caller = self:get()
+      if OBS_HOOK and OBS_HOOK(caller, id) then return end
+      if not NAV.open or not NAV.cfg or not NAV.pad(NAV.team) or not shownChain(NAV.team, {}, 0)
+        or not BAG.belongs(caller, NAV.vm) then return end
       local t = navInstead()
       if t == "Bottom" then t = "SideBar" end
       local c = NAV.sideCell
@@ -1415,15 +1825,14 @@ local function navStep(base, d)
 end
 local function taskNav()
   local t = NAV.team
-  if not (t and t:IsValid()) then
-    navFlag(false)
+  if not live(t) or not shownChain(t, {}, 0) then
+    NAV.open, NAV.wasPad = false, false
+    if MASKS.prime ~= 0 then navFlag(false) end
     if now() < NAV.findAt then return end
-    NAV.findAt = now() + 1
-    t = nil; for _, v in ipairs(FindAllOf("BPMV_PrimeTeam_C") or {}) do if live(v) then t = v end end
-    NAV.team, NAV.open = t, false
+    NAV.findAt = now() + 0.25
+    t = NAV.shown("BPMV_PrimeTeam_C"); NAV.team = t
     if not t then return end
   end
-  if not t:IsVisible() then NAV.open = false; navFlag(false) return end
   if not NAV.open then
     NAV.open, NAV.cur, NAV.stable, NAV.want, NAV.pending, NAV.beforeBottom = true, nil, nil, nil, nil, "SideBar"
     NAV.cells, NAV.sideCell, NAV.bpIdx, NAV.force = nil, nil, 0, false
@@ -1439,6 +1848,13 @@ local function taskNav()
     pcall(function() NAV.lt, NAV.rt = navTriggers() end)
   end
   if not NAV.cfg or not (NAV.vm and NAV.vm:IsValid() and NAV.im and NAV.im:IsValid()) then navFlag(false) return end
+  local pad = NAV.pad(t)
+  local enteredPad = pad and not NAV.wasPad
+  NAV.wasPad = pad
+  if not pad or BAG.bound(GIFT, GIFT.grid) then
+    NAV.want, NAV.pending, NAV.force, NAV.lt, NAV.rt = nil, nil, false, false, false
+    navFlag(false); return
+  end
   local cur = navRegion()
   local ev = PADEV
   if ev and (MASKS.prime ~= 0 or NAV.flag) then
@@ -1455,7 +1871,6 @@ local function taskNav()
   local pressed = 0
   if rt and not NAV.rt then pressed = 1 elseif lt and not NAV.lt then pressed = -1 end
   NAV.lt, NAV.rt = lt, rt
-  local pad = true; pcall(function() pad = NAV.im:IsGamepadMode() end)
   -- the game moves the focus when LT/RT is RELEASED (measured: ~1 press length after the press), so the
   -- target is chosen on press and applied on release; navGo then holds it for 0.3 s against late moves
   if pressed ~= 0 and cur then
@@ -1463,7 +1878,7 @@ local function taskNav()
     NAV.pending, NAV.pendingWhy, NAV.want = navStep(base, pressed), pressed > 0 and "RT" or "LT", nil
   end
   if NAV.pending and not (lt or rt) then navGo(NAV.pending, NAV.pendingWhy); NAV.pending = nil end
-  if not NAV.pending and not NAV.want and not (lt or rt) and pad and (cur == "Property" or cur == "Equip") then
+  if not NAV.pending and not NAV.want and not (lt or rt) and enteredPad and (cur == "Property" or cur == "Equip") then
     local base = NAV.stable or "SideBar"
     navGo((base == "SideBar") and "Backpack" or (base == "Backpack") and "SideBar" or NAV.beforeBottom, "d-pad into " .. cur)
   end
@@ -1495,9 +1910,9 @@ local function taskNav()
           end
         else
           local g = HIDE.grid
-          if g and g:IsValid() and HIDE.vn then
-            for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
-              if en:IsValid() and en:IsVisible() and en:HasFocusedDescendants() and en:GetFullName():find(HIDE.vn, 1, true) then
+          if BAG.same(HIDE.root, NAV.vm) and live(g) then
+            for _, en in ipairs(gridItems(g, true)) do
+              if live(en) and en:HasFocusedDescendants() then
                 local i = g:GetIndexForItem(en:GetBindedDataObj()); if i and i >= 0 then NAV.bpIdx = i end
                 break
               end
@@ -1511,7 +1926,7 @@ local function taskNav()
   local m = 0
   if r == "SideBar" or r == "Backpack" or r == "Bottom" or r == "Property" or r == "Equip" then m = NAV_BITS.trig end
   if r == "SideBar" then m = m | NAV_BITS.right elseif r == "Bottom" then m = m | NAV_BITS.up end
-  maskSet("prime", m)                 -- also in mouse mode: it only filters gamepad input
+  maskSet("prime", m)
   NAV.cur = cur
 end
 
@@ -1573,10 +1988,10 @@ local function obsGo(target, why, hold)
 end
 -- the request comes from the observe VM (opening) or from a sub-module VM (backpack left edge: JHBackpackVMBase),
 -- so every request while the 观察 screen is shown counts
-OBS_HOOK = function(self, id)
-  if not OBS.cfg then return false end                 -- not OBS.open: also the opening request, before taskObs saw it
+OBS_HOOK = function(caller, id)
+  if not OBS.open or not OBS.cfg then return false end
   local v = OBS.view
-  if not (v and v:IsValid() and v:IsVisible()) then return false end
+  if not NAV.pad(v) or not shownChain(v, {}, 0) or not BAG.belongs(caller, OBS.vm) then return false end
   local key = id:get():ToString()
   if key == "Property" or key == "Equip" then
     id:set(FName("SideBar"))
@@ -1587,32 +2002,28 @@ OBS_HOOK = function(self, id)
 end
 local function taskObs()
   local v = OBS.view
-  if not (v and v:IsValid()) then
+  if not live(v) or not shownChain(v, {}, 0) then
+    OBS.open, OBS.wasPad = false, false
+    BAG.observing, BAG.observedGrid = false, nil
+    if MASKS.obs ~= 0 then maskSet("obs", 0) end
     if now() < OBS.findAt then return end
-    OBS.findAt = now() + 1
-    v = nil; for _, x in ipairs(FindAllOf("BPMV_Observe_C") or {}) do if live(x) then v = x end end
-    OBS.view, OBS.open = v, false
+    OBS.findAt = now() + 0.25
+    v = NAV.shown("BPMV_Observe_C"); OBS.view = v
     if not v then return end
-    OBS.cfg = iniNumber("prime_skip_panels", 1) == 1
-    if OBS.cfg then navHook() end
   end
-  if not v:IsVisible() then if OBS.open then OBS.open = false; maskSet("obs", 0) end return end
+  OBS.vm, OBS.bpView, OBS.grid = BAG.observe(v)
   if not OBS.open then
     OBS.open, OBS.stable, OBS.want, OBS.bpIdx, OBS.btn = true, nil, nil, 0, nil
     OBS.cfg = iniNumber("prime_skip_panels", 1) == 1
     if OBS.cfg then navHook() end
-    OBS.vm = v:GetNeoUIVM()
-    OBS.vn = v:GetFName():ToString()
-    OBS.grid, OBS.bpView = nil, nil
-    for _, x in ipairs(FindAllOf("BPMV_JHBackpack_Basic_C") or {}) do
-      if live(x) and x:IsVisible() then local g = x.GRID_ITEM; if g and g:IsValid() then OBS.grid, OBS.bpView = g, x end end
-    end
-    if OBS.cfg then local c0 = obsRegion(); obsGo("Bottom", "open, game focused " .. tostring(c0), 1.0) end
+    if OBS.cfg and NAV.pad(v) then obsGo("Bottom", "open", 1.0) end
   end
   if not OBS.cfg or not (OBS.vm and OBS.vm:IsValid()) then maskSet("obs", 0) return end
+  local pad = NAV.pad(v)
+  local enteredPad = pad and not OBS.wasPad
+  OBS.wasPad = pad
+  if not pad or BAG.bound(GIFT, GIFT.grid) then OBS.want, OBS.force = nil, false; maskSet("obs", 0); return end
   local cur, btn = obsRegion()
-  local pad = true; pcall(function() pad = NAV.im and NAV.im:IsValid() and NAV.im:IsGamepadMode() end)
-  if not NAV.im then pcall(function() for _, s in ipairs(FindAllOf("NeoUISubsystem") or {}) do if live(s) then NAV.im = s.InputManager end end end) end
   local ev = PADEV
   if ev and MASKS.obs ~= 0 then
     for ch in ev:gmatch("[LR<>%^v]") do
@@ -1621,7 +2032,7 @@ local function taskObs()
       elseif ch == "^" and base == "Bottom" then obsGo("Backpack", "up pad") end
     end
   end
-  if pad and not OBS.want and (cur == "Property" or cur == "Equip") then
+  if enteredPad and not OBS.want and (cur == "Property" or cur == "Equip") then
     obsGo(OBS.stable or "Bottom", "landed on " .. cur)
   end
   if OBS.want then
@@ -1641,8 +2052,9 @@ local function taskObs()
       OBS.memAt = now()
       pcall(function()
         local g = OBS.grid
-        for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_C") or {}) do
-          if en:IsValid() and en:IsVisible() and en:HasFocusedDescendants() and en:GetFullName():find(OBS.bpView:GetFName():ToString(), 1, true) then
+        if not live(g) then return end
+        for _, en in ipairs(gridItems(g, true)) do
+          if live(en) and en:HasFocusedDescendants() then
             local i = g:GetIndexForItem(en:GetBindedDataObj()); if i and i >= 0 then OBS.bpIdx = i end
             break
           end
@@ -1653,21 +2065,22 @@ local function taskObs()
   local r = OBS.want or cur
   local m = 0
   if r then m = NAV_BITS.trig; if r == "Bottom" then m = m | NAV_BITS.up end end
-  maskSet("obs", m)                   -- also in mouse mode: it only filters gamepad input
+  maskSet("obs", m)
 end
-local function taskPadEv() PADEV = navPadEvents() end
+local function taskPadEv()
+  PADEV = navPadEvents()
+  local intent = PADEV and PADEV:match(".*([Mm])")
+  if intent then taskMapFlag(intent) end
+end
 
 -- ---------------------------------------------------------------- 11) battle speed: x1 -> x2 -> 速战 -> x1
 -- The game's speed button only toggles x1 / x2: it sets the persistent level's WorldSettings.TimeDilation to
 -- 1.0 / 2.0 (measured 2026-11-23; nothing else changes) and shows BTN_SpeedUp1 (x1 icon) or BTN_SpeedUp2 (x2).
--- 速战 (quick battle): the game's own auto battle (view:EnableAutoBattle) + TimeDilation held at quick_speed
--- (default 500, configurable up to 1000; MaxGlobalTimeDilation raised if needed). The fight is still played out by the game - win or lose -,
--- only compressed: 1v1 sparring took 6-10 s at x2 and 0.6-2.3 s at x20/x50/x100 (9 fights, no stalls).
 -- Mouse speed-button hooks and the proxy's single-Y events advance the same cycle, not icon changes:
 -- x1 -> x2 -> 速战 -> x1. The game restores its icon during fight startup and cut-ins; that is not a press.
 -- Our own icon corrections are guarded so they cannot advance the cycle. Early presses are queued until the
 -- battle view is ready. Auto battle is switched off again only if we switched it on. The level is kept for
--- the next fight. Watchdog: real-time quick_timeout (max 30 s) releases effects and restores x1 / our auto change.
+-- the next fight. The watchdog measures time since combat activity, not the whole battle.
 -- quick_mask = 1 covers the flickering battle; quick_mute = 1 temporarily mutes only this game's audio session.
 -- Both native effects have a 500 ms heartbeat: a Lua restart or stopped loop releases them automatically.
 -- Reads only widget visibility and simple values; no struct/slot reads (those crashed UE4SS, 2026-11-23 12:20).
@@ -1676,9 +2089,9 @@ do
 local function now() return RUNTIME.clock end -- monotonic milliseconds from the native owner receipt
 local SPD_Q = 3
 local SPD = { view = nil, ws = nil, findAt = 0, active = false, on = nil, level = 1, mem = 1, written = nil,
-  overwrites = 0, exports = nil, quick = true, qspeed = 500, qtimeout = 10, qStart = nil, qClock = nil, autoByUs = false, mask = true,
-  mute = true, correcting = false, presses = 0, padPresses = 0, hooks = {}, hookAt = 0, maxOrig = nil, over = false, resAt = 0,
-  fightKey = nil, pressFight = nil, pc = nil, lostAt = nil, recovered = false }
+  overwrites = 0, exports = nil, quick = true, qspeed = 50, qtimeout = 10, qStart = nil, qClock = nil, autoByUs = false, mask = true,
+  mute = true, correcting = false, presses = 0, padPresses = 0, hooks = {}, hookAt = 0, over = false, resAt = 0,
+  fightKey = nil, pressFight = nil, pc = nil, recovered = false, fast = false }
 do                                                                     -- level kept across mod / game restarts
   local m = tonumber((readFirst("speed_level.txt") or ""):match("%d") or "")
   if m and m >= 1 and m <= 3 then SPD.mem = m end
@@ -1713,7 +2126,8 @@ local function spdGameOn(v)
   return v2
 end
 local function spdSetGame(v, on)
-  if spdGameOn(v) == on then return end
+  local current = spdGameOn(v)
+  if current == nil or current == on then return end
   SPD.correcting = true
   local ok, err = pcall(function() if on then v:HandleBtn_SpeedUp_1() else v:HandleBtn_SpeedUp_2() end end)
   SPD.correcting = false
@@ -1721,25 +2135,168 @@ local function spdSetGame(v, on)
   SPD.on = spdGameOn(v)
 end
 local function spdFightPawn()
-  for _, pc in ipairs(FindAllOf("BP_PlayerController_C") or {}) do
-    if live(pc) and live(pc.Pawn) then
-      local key = pc.Pawn:GetFullName()
-      if key:find("BP_FightSpectator", 1, true) then return true, key, pc end
+  local controller, pawn, world, instance, level = RUNTIME.player()
+  if controller then
+    local key = pawn:GetFullName()
+    return key:find("BP_FightSpectator", 1, true) ~= nil, key, controller, instance, level, pawn
+  end
+  return false, nil, nil, instance, level
+end
+local function spdOwned(widget, controller, instance)
+  if not controller or not instance or not live(widget) or widget:HasAnyInternalFlags(EInternalObjectFlags.PendingKill) then return false end
+  local owner = widget:GetOwningPlayer()
+  if live(owner) then return owner:GetAddress() == controller:GetAddress() end
+  local outer = widget:GetOuter()
+  return live(outer) and outer:GetAddress() == instance:GetAddress()
+end
+local function spdAttached(widget, controller, instance)
+  if not spdOwned(widget, controller, instance) then return false end
+  for depth = 1, 32 do
+    if widget:IsA(uwClass) and widget:IsInViewport() then return true end
+    local parent = widget:GetParent()
+    if not live(parent) then
+      local tree = widget:GetOuter()
+      parent = live(tree) and tree:GetOuter()
+      if not live(parent) or not parent:IsA(uwClass) then return false end
     end
+    widget = parent
   end
   return false
 end
+local function spdHud(controller, instance)
+  local cached = SPD.view
+  if not spdAttached(cached, controller, instance) then cached, SPD.view = nil, nil end
+  if (not cached or not cached:IsVisible()) and now() >= SPD.findAt then
+    SPD.findAt = now() + 0.25
+    for _, candidate in ipairs(FindAllOf("BPMV_JHBattleModule_C") or {}) do
+      if spdOwned(candidate, controller, instance) and shownChain(candidate, {}, 0) then SPD.view = candidate; break end
+    end
+  end
+  return SPD.view
+end
 local function spdQueuePress(v)
   if not runtimePoll() or not live(v) then return end
-  local fight, key = spdFightPawn(); if not fight or (SPD.over and key == SPD.fightKey) then return end
+  local fight, key, controller, instance = spdFightPawn()
+  if not fight or (SPD.over and key == SPD.fightKey) or not spdAttached(v, controller, instance) then return end
   local a = v:GetAddress()
   if SPD.pressView ~= a or SPD.pressFight ~= key then SPD.pressView, SPD.pressFight, SPD.presses = a, key, 0 end
   SPD.presses = SPD.presses + 1
 end
+local function spdPresentation(self, animation, startTime, loops, playMode, rate)
+  if not SPD.fast or loops:get() ~= 1 then return end
+  local clip = animation:get(); if not live(clip) then return end
+  local name = clip:GetFName():ToString():gsub("_INST$", "")
+  local class = name == "ShowUltraSkill" and "BPMV_JHBattleModule_C"
+    or (name == "ShowUltraSkill_CN" or name == "ShowUltraSkill_EN") and "BPMV_BattleSpell_C"
+  if not class then return end
+  local widget = self:get()
+  local fight, key, controller, instance = spdFightPawn()
+  if not fight or key ~= SPD.fightKey or not live(widget) or widget:GetClass():GetFName():ToString() ~= class
+    or not spdAttached(widget, controller, instance) then return end
+  local speed = tonumber(rate:get())
+  if speed and speed > 0 and speed < 16 then rate:set(math.min(16, speed * 16)) end
+end
+local function spdBattleActor(actor, level)
+  if not live(actor) or actor:HasAnyInternalFlags(EInternalObjectFlags.PendingKill) or actor:IsActorBeingDestroyed() then return false end
+  local outer = actor:GetOuter()
+  if live(outer) and outer:GetAddress() == level:GetAddress() then return true end
+  local world, current = actor:GetWorld(), level:GetOuter()
+  return live(world) and live(current) and world:GetAddress() == current:GetAddress()
+end
+local function spdProgress(self, actorParam, turnStart)
+  if not SPD.fast and not (turnStart and SPD.over) then return end
+  local fight, key, controller, instance, level, pawn = spdFightPawn()
+  if not fight or key ~= SPD.fightKey or level:GetAddress() ~= SPD.levelAddr then return end
+  local manager = self:get()
+  local spectator = live(manager) and manager.FightSpectator
+  if live(spectator) then
+    if spectator:GetAddress() ~= pawn:GetAddress() then return end
+  elseif not actorParam or not spdBattleActor(actorParam:get(), level) then return end
+  if SPD.over then SPD.newTurn = true else SPD.progress = now() end
+end
+local function spdCurrentAbility(ability)
+  if not SPD.fast or not live(SPD.abilityClass) or not live(ability) or not ability:IsA(SPD.abilityClass) then return end
+  local fight, key, controller, instance, level = spdFightPawn()
+  if not fight or key ~= SPD.fightKey or level:GetAddress() ~= SPD.levelAddr then return end
+  local actor = ability:GetOwningFightCharacter()
+  if spdBattleActor(actor, level) then return actor end
+end
+local function spdAction(self)
+  if SPD.fast and spdCurrentAbility(self:get()) then SPD.progress = now() end
+end
+local function spdSkillDelay(self, context, duration, latentInfo)
+  if not SPD.fast then return end
+  local seconds = duration:get()
+  if seconds <= 0.01 then return end
+  local ability = context:get()
+  if not spdCurrentAbility(ability) then return end
+  local latent = latentInfo:get()
+  if latent.UUID ~= -1255582134 and latent.UUID ~= 819583215 then return end
+  if latent.ExecutionFunction:ToString() == "ExecuteUbergraph_GA_Base" and live(latent.CallbackTarget)
+    and latent.CallbackTarget:GetAddress() == ability:GetAddress() then duration:set(0.01) end
+end
+local function spdSkillTime(self, context, scale)
+  if not SPD.fast or not SPD.written then return end
+  local requested = scale:get()
+  if requested > 0 and requested <= 2 and requested < SPD.written and spdCurrentAbility(context:get()) then scale:set(SPD.written) end
+end
+local function spdFreezeStart(self, context, paused)
+  if not SPD.fast then return end
+  SPD.freeze = nil
+  if not paused:get() then return end
+  local ability = context:get()
+  local actor = spdCurrentAbility(ability)
+  if not actor then return end
+  local seconds = tonumber(ability["定屏总耗时"])
+  if seconds and seconds > 0.03 then SPD.freeze = {actor = actor:GetAddress(), seconds = seconds} end
+end
+local function spdFreezeDelay(self, callback, duration)
+  local freeze = SPD.freeze
+  if not freeze then return end
+  SPD.freeze = nil
+  if not SPD.fast or duration:get() ~= freeze.seconds then return end
+  local component = self:get()
+  local owner = live(component) and component:GetOwner()
+  if live(owner) and owner:GetAddress() == freeze.actor then duration:set(0.03) end
+end
+local localData = os.getenv("LOCALAPPDATA")
+local battleLog = localData and (localData .. [[\Wandering_Sword\Saved\Logs\Wandering_Sword.log]])
+local function spdReadActions(start)
+  if start then SPD.logPos, SPD.logTail, SPD.logNext = nil, "", 0 end
+  if not battleLog or (not start and now() < SPD.logNext) then return end
+  SPD.logNext = now() + 0.5
+  local file = io.open(battleLog, "rb"); if not file then return end
+  local finish = file:seek("end")
+  local previous = SPD.logPos
+  SPD.logPos = finish
+  if not finish or not previous or finish < previous then SPD.logTail = ""; file:close(); return end
+  if finish == previous then file:close(); return end
+  local offset = math.max(previous, finish - 16384)
+  local data = file:seek("set", offset) and file:read(finish - offset)
+  file:close()
+  if not data then SPD.logTail = ""; return end
+  data = (offset == previous and SPD.logTail or "") .. data
+  local lines, tail = data:match("^(.*\n)([^\n]*)$")
+  SPD.logTail = (tail or data):sub(-512)
+  if lines and lines:find("LogTemp: 当前选中的技能 NPCId:%s*%d+,%s*SkillId:%s*%d+,%s*SkillName%s*:%s*Default__GA_[%w_]+") then SPD.progress = now() end
+end
+local function spdHook(path, callback)
+  if SPD.hooks[path] then return end
+  local fn = StaticFindObject(path)
+  if fn and fn:IsValid() then SPD.hooks[path] = pcall(RegisterHook, path, function(...) pcall(callback, ...) end) end
+end
 local function spdInstallHooks()
-  if SPD.hooks[1] and SPD.hooks[2] then return end
   if now() < SPD.hookAt then return end
-  SPD.hookAt = now() + 1
+  SPD.hookAt = now() + 2
+  spdHook("/Script/UMG.UserWidget:PlayAnimation", spdPresentation)
+  if not live(SPD.abilityClass) then SPD.abilityClass = StaticFindObject("/Script/JH.JHGameplayAbility") end
+  spdHook("/Script/JH.FightManager:HandlePawnTurnStart", function(self, actor) spdProgress(self, actor, true) end)
+  spdHook("/Script/JH.FightManager:HandlePawnBeAttack", function(self, actor) spdProgress(self, actor, false) end)
+  spdHook("/Script/JH.JHGameplayAbility:EndTurnForAbility", spdAction)
+  spdHook("/Script/Engine.KismetSystemLibrary:Delay", spdSkillDelay)
+  spdHook("/Script/Engine.GameplayStatics:SetGlobalTimeDilation", spdSkillTime)
+  spdHook("/Script/Engine.GameplayStatics:SetGamePaused", spdFreezeStart)
+  spdHook("/Script/JH.JHAbilitySystemComponent:AddDelayCallback", spdFreezeDelay)
   for n = 1, 2 do
     if not SPD.hooks[n] then
       local path = "/Script/JH.JHNeoUIBattleModuleView:HandleBtn_SpeedUp_" .. n
@@ -1761,13 +2318,14 @@ local function spdInstallHooks()
     end
   end
 end
-local function spdFindWS()
-  local pc = SPD.pc; if not live(pc) then return nil end
-  local lv = pc:GetFullName():match("%.([%w_]+):PersistentLevel"); if not lv then return nil end
+local function spdFindWS(level)
+  if not level then return end
+  local settings = level.WorldSettings
+  if live(settings) then return settings end
   for _, o in ipairs(FindAllOf("WorldSettings") or {}) do
     if live(o) then
-      local ok, n = pcall(function() return o:GetOuter():GetOuter():GetFName():ToString() end)
-      if ok and n == lv then return o end
+      local outer = o:GetOuter()
+      if live(outer) and outer:GetAddress() == level:GetAddress() then return o end
     end
   end
   return nil
@@ -1783,126 +2341,163 @@ end
 local function spdAuto(v, on)
   local ok, isAuto = pcall(function() return v:BtnAutoBattleFlagIsAuto() end)
   if not ok or type(isAuto) ~= "boolean" then return false end
-  if on and not isAuto then
-    local done = pcall(function() v:EnableAutoBattle() end); if done then spdAutoMark(true) end
-  elseif not on and isAuto and SPD.autoByUs then
+  if on then
+    if not isAuto and not SPD.autoTried then
+      SPD.autoTried = true
+      if not pcall(function() v:EnableAutoBattle() end) then return false end
+      ok, isAuto = pcall(function() return v:BtnAutoBattleFlagIsAuto() end)
+    end
+    if ok and isAuto and SPD.autoTried then spdAutoMark(true) end
+    return ok and isAuto == true
+  end
+  if isAuto and (SPD.autoByUs or SPD.autoTried) then
     pcall(function() v:DisableAutoBattle() end)
-  elseif not on then spdAutoMark(false) end
-  local read, actual = pcall(function() return v:BtnAutoBattleFlagIsAuto() end)
-  if not on and read and actual == false then spdAutoMark(false) end
-  return read and actual == on
+    ok, isAuto = pcall(function() return v:BtnAutoBattleFlagIsAuto() end)
+  end
+  SPD.autoTried = false
+  if ok and not isAuto then spdAutoMark(false) end
+  return ok and isAuto == false
 end
 local function spdName(l) return l == SPD_Q and "速战" or ("x" .. l) end
-local function spdEnd()
+local function spdReleaseLimit(settings)
+  local limit = SPD.limit
+  SPD.limit, SPD.limitChanged = nil, false
+  if limit and settings and limit.address == settings:GetAddress() and settings.MaxGlobalTimeDilation == limit.applied then
+    settings.MaxGlobalTimeDilation = limit.before
+  end
+end
+local function spdQuickRate(settings)
+  local ceiling, limit = settings.MaxGlobalTimeDilation, SPD.limit
+  if limit and (settings:GetAddress() ~= limit.address or ceiling ~= limit.applied) then
+    SPD.limit, SPD.limitChanged = nil, true
+  elseif not limit and not SPD.limitChanged and ceiling == 20 and SPD.qspeed > ceiling then
+    SPD.limit = {address = settings:GetAddress(), before = ceiling, applied = SPD.qspeed}
+    settings.MaxGlobalTimeDilation = SPD.qspeed
+    ceiling = settings.MaxGlobalTimeDilation
+  end
+  return math.min(SPD.qspeed, ceiling)
+end
+local function spdRestore(level)
+  if not SPD.written and not SPD.limit then return end
+  local settings = level and level:GetAddress() == SPD.levelAddr and spdFindWS(level)
+  if settings and SPD.written and math.abs(settings.TimeDilation - SPD.written) < 0.01 then settings.TimeDilation = 1 end
+  spdReleaseLimit(settings)
+end
+function RUNTIME.beforeSpeedMap()
+  if not SPD.limit then return end
+  local world = RUNTIME.world()
+  local level = world and world.PersistentLevel
+  if live(level) then spdRestore(level) end
+end
+local function spdEnd(level)
+  SPD.fast, SPD.progress, SPD.freeze = false, nil, nil
   spdPadInput(false)
   spdMute(false)
   if SPD.active then
-    if SPD.view and SPD.view:IsValid() then spdAuto(SPD.view, false) end
-    local ws = SPD.ws
-    if ws and ws:IsValid() then
-      if SPD.written then ws.TimeDilation = 1.0 end
-      if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig end
-    end
+    spdRestore(level)
     local dur = SPD.qStart and (os.time() - SPD.qStart) or nil
     print(string.format("[GamepadTweaks] speed: fight over at %s%s (game re-applied %d times)\n", spdName(SPD.level),
       dur and string.format(", 速战 %d s", dur) or "", SPD.overwrites))
   end
-  SPD.active, SPD.view, SPD.ws, SPD.on, SPD.written, SPD.qStart, SPD.maxOrig = false, nil, nil, nil, nil, nil, nil
+  SPD.active, SPD.view, SPD.ws, SPD.on, SPD.written, SPD.qStart = false, nil, nil, nil, nil, nil
   SPD.over, SPD.qClock, SPD.seen, SPD.pressView, SPD.presses, SPD.padPresses = false, nil, nil, nil, 0, 0
-  SPD.findAt, SPD.fightKey, SPD.pressFight, SPD.pc, SPD.lostAt = 0, nil, nil, nil, nil
-  SPD.resultReady, SPD.recovered, SPD.startWait = false, false, nil
+  SPD.findAt, SPD.fightKey, SPD.pressFight, SPD.pc, SPD.pcAddr, SPD.levelAddr, SPD.instance = 0, nil, nil, nil, nil, nil, nil
+  SPD.result, SPD.newTurn, SPD.recovered, SPD.autoTried, SPD.restoreAuto, SPD.startWait, SPD.resAt = nil, false, false, false, false, nil, -1
   spdBadge(0)
 end
+function RUNTIME.endSpeed(level) if SPD.fightKey then spdEnd(level) end end
 -- Always release native effects first. This path must run before any HUD/icon readiness return.
 spdRecover = function(reason)
+  if SPD.recovered then return end
+  SPD.recovered = true
+  SPD.fast, SPD.progress = false, nil
   spdMute(false); spdBadge(0); spdPadInput(false)
-  if live(SPD.view) then pcall(spdAuto, SPD.view, false) end
-  local ws = SPD.ws
-  if live(ws) then
-    pcall(function()
-      ws.TimeDilation = 1.0
-      if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig end
-    end)
-  end
-  SPD.level, SPD.qStart, SPD.qClock, SPD.maxOrig, SPD.written = 1, nil, nil, nil, nil
-  SPD.presses, SPD.padPresses, SPD.recovered = 0, 0, true
+  local wasActive = SPD.active
+  SPD.level, SPD.qStart, SPD.qClock = 1, nil, nil
+  SPD.presses, SPD.padPresses, SPD.restoreAuto = 0, 0, SPD.autoByUs
   spdRemember(1)
-  print("[GamepadTweaks] speed: recovery -> x1/manual (" .. reason .. ")\n")
+  print("[GamepadTweaks] speed: recovery -> x1 (" .. reason .. ")\n")
+  local fight, key, controller, instance, level = spdFightPawn()
+  spdRestore(level)
+  SPD.written = nil
+  if wasActive and fight and key == SPD.fightKey and level:GetAddress() == SPD.levelAddr then
+    local settings = spdFindWS(level); if settings then settings.TimeDilation = 1 end
+    if spdAttached(SPD.view, controller, instance) then
+      pcall(spdSetGame, SPD.view, false); pcall(spdAuto, SPD.view, false); SPD.restoreAuto = false
+    end
+  end
 end
 -- result screen up: the fight is decided, stop holding the speed (the screen's own animations run normally)
 local function spdResult()
   for _, cn in ipairs({ "BPMV_BattleWinMaster_C", "BPMV_BattleFailure_C" }) do
-    for _, o in ipairs(FindAllOf(cn) or {}) do if live(o) and o:IsVisible() then return cn end end
+    for _, o in ipairs(FindAllOf(cn) or {}) do if spdOwned(o, SPD.pc, SPD.instance) and shownChain(o, {}, 0) then return cn end end
   end
   return nil
 end
 taskSpeed = function()
+  SPD.freeze = nil
   spdInstallHooks()
-  local fight, key, pc = spdFightPawn()
+  local fight, key, pc, instance, level = spdFightPawn()
   local pad = RUNTIME.events; RUNTIME.events = 0
-  -- A new spectator is a new fight even if the 300 ms poll never saw the field between fights.
-  if fight and key ~= SPD.fightKey then
-    local pending, pv = SPD.pressFight == key and SPD.presses or 0, SPD.pressView
-    spdEnd()
-    SPD.fightKey, SPD.pc, SPD.startWait = key, pc, now()
-    SPD.presses, SPD.pressView, SPD.pressFight = pending, pv, key
-  end
-  if fight then
-    inFight, SPD.lostAt = true, nil
-    if not SPD.over then SPD.padPresses = SPD.padPresses + pad end
-  else
-    SPD.lostAt = SPD.lostAt or now()
-    if now() - SPD.lostAt >= 0.5 then spdEnd(); return end
-  end
-  if SPD.over then
-    spdPadInput(false)
-    -- Some battles reuse the spectator: a closed result followed by a visible HUD starts a new cycle.
-    if not spdResult() and live(SPD.view) and SPD.view:IsVisible() then
-      local keepKey, keepPC = SPD.fightKey, SPD.pc
-      spdEnd(); SPD.fightKey, SPD.pc, SPD.startWait = keepKey, keepPC, now()
+  if not fight then
+    if SPD.fightKey then
+      spdEnd(level)
+      if pc and (key:find("BP_SceneHero",1,true) or key:find("BP_WorldHero",1,true)) then
+        inFight, inBattle = false, key:find("BP_WorldHero",1,true) ~= nil
+        lastBattle = inBattle; writeBattleFlag()
+      end
     end
     return
   end
-  -- Wall time and exception recovery cannot be blocked by a hidden/destroyed HUD or unreadable icons.
-  if SPD.qClock and now() - SPD.qClock >= SPD.qtimeout then spdRecover("quick timeout") end
-  if not SPD.active and SPD.startWait and now() - SPD.startWait >= 5 and not SPD.recovered then
-    spdRecover("HUD not ready")
+  -- A new spectator is a new fight even if the 300 ms poll never saw the field between fights.
+  if key ~= SPD.fightKey or SPD.levelAddr ~= level:GetAddress() or SPD.pcAddr ~= pc:GetAddress() then
+    local pending, pv = SPD.pressFight == key and SPD.presses or 0, SPD.pressView
+    spdEnd(level)
+    SPD.fightKey, SPD.pc, SPD.pcAddr, SPD.instance, SPD.levelAddr, SPD.startWait = key, pc, pc:GetAddress(), instance, level:GetAddress(), now()
+    SPD.presses, SPD.pressView, SPD.pressFight = pending, pv, key
   end
-  spdPadInput(fight and not SPD.recovered)
-  -- the battle HUD is hidden during skill cut-ins: keep the view once found and keep holding the speed meanwhile
-  -- (v4.15 first build dropped the view while hidden, so the game ran those cut-ins at x1)
-  -- several BPMV_JHBattleModule_C instances can exist (the last fight's one lingers): switch to a visible one
-  -- whenever ours is hidden, keep ours only while none is visible (cut-in)
-  local v = SPD.view
-  if not (v and v:IsValid() and v:IsVisible()) then
-    if now() >= SPD.findAt or not (v and v:IsValid()) then
-      SPD.findAt = now() + 0.25
-      local vis = nil
-      for _, x in ipairs(FindAllOf("BPMV_JHBattleModule_C") or {}) do if live(x) and x:IsVisible() then vis = x end end
-      if vis then SPD.view = vis elseif not (v and v:IsValid()) then SPD.view = nil end
-      v = SPD.view
+  if not inFight then inFight, inBattle = true, true; writeBattleFlag() end
+  if not SPD.over then SPD.padPresses = SPD.padPresses + pad end
+  if now() - SPD.resAt >= 0.12 then
+    SPD.resAt, SPD.result = now(), spdResult()
+  end
+  if SPD.result and not SPD.over then
+    SPD.over, SPD.newTurn, SPD.presses, SPD.padPresses, SPD.fast, SPD.progress = true, false, 0, 0, false, nil
+    spdPadInput(false); spdMute(false); spdBadge(0)
+    if SPD.active then
+      local settings = spdFindWS(level); if settings then settings.TimeDilation = 1 end
+      spdReleaseLimit(settings)
+      if (SPD.autoByUs or SPD.autoTried) and spdAttached(SPD.view, pc, instance) then spdAuto(SPD.view, false) end
+      SPD.written = nil
+      if SPD.qClock then print(string.format("[GamepadTweaks] speed: 速战 decided in %.1f s (%s, game re-applied %d times)\n", now() - SPD.qClock, SPD.result, SPD.overwrites)) end
     end
-    if not v then return end
+  end
+  if SPD.over then
+    if not SPD.result and SPD.newTurn then
+      spdEnd(level); SPD.fightKey, SPD.pc, SPD.pcAddr, SPD.instance, SPD.levelAddr, SPD.startWait = key, pc, pc:GetAddress(), instance, level:GetAddress(), now()
+    end
+    return
+  end
+  if SPD.recovered then
+    local available = spdHud(pc, instance)
+    if not available then spdPadInput(false); return end
+    if SPD.restoreAuto then spdAuto(available, false); SPD.restoreAuto = false end
+    spdPadInput(true)
+    if SPD.presses == 0 and SPD.padPresses == 0 then return end
+  end
+  if SPD.fast then spdReadActions(false) end
+  if SPD.qClock and now() - (SPD.progress or SPD.qClock) >= SPD.qtimeout then spdRecover("no combat activity"); return end
+  if not SPD.active and SPD.startWait and now() - SPD.startWait >= 5 and not SPD.recovered then
+    spdRecover("HUD not ready"); return
+  end
+  spdPadInput(true)
+  local v = spdHud(pc, instance)
+  if not v then
+    if SPD.fast then spdRecover("battle HUD detached") end
+    return
   end
   local ws = SPD.ws
-  if not (ws and ws:IsValid()) then ws = spdFindWS(); SPD.ws = ws; if not ws then return end end
-  if now() - SPD.resAt > 0.1 then
-    SPD.resAt = now()
-    local r = spdResult()
-    if not r then SPD.resultReady = true end
-    if r and SPD.resultReady and SPD.active then
-      SPD.over, SPD.presses, SPD.padPresses = true, 0, 0
-      spdPadInput(false)
-      spdMute(false)
-      spdAuto(v, false)
-      ws.TimeDilation = 1.0
-      if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig; SPD.maxOrig = nil end
-      SPD.written = nil
-      if SPD.qClock then print(string.format("[GamepadTweaks] speed: 速战 decided in %.1f s (%s, game re-applied %d times)\n", now() - SPD.qClock, r:gsub("BPMV_", ""):gsub("_C$", ""), SPD.overwrites)) end
-      spdBadge(0)
-      return
-    end
-  end
+  if not (ws and ws:IsValid()) then ws = spdFindWS(level); SPD.ws = ws; if not ws then return end end
   local hudUp = v:IsVisible()
   local on = spdGameOn(v)                                           -- the game's flag also works during cut-ins
   if on == nil then on = SPD.on end
@@ -1921,7 +2516,7 @@ taskSpeed = function()
     if SPD.presses == 0 and SPD.padPresses == 0 and now() - SPD.seen < 0.3 then return end    -- pending presses never get discarded
     SPD.active, SPD.on, SPD.overwrites, SPD.recovered = true, on, 0, false
     SPD.quick = iniNumber("quick_battle", 1) == 1
-    SPD.qspeed = math.max(3, math.min(1000, iniNumber("quick_speed", 500)))
+    SPD.qspeed = math.max(3, math.min(50, iniNumber("quick_speed", 50)))
     SPD.qtimeout = math.max(5, math.min(30, iniNumber("quick_timeout", 10)))
     SPD.mask = iniNumber("quick_mask", 1) == 1 and SPD.exports ~= nil and SPD.exports[6] ~= nil
     SPD.mute = iniNumber("quick_mute", 1) == 1
@@ -1951,26 +2546,25 @@ taskSpeed = function()
   -- Icon refreshes are not user input. Keep the game's persistent flag in sync with our chosen level.
   -- 速战 uses the game's x1 flag; its actual TimeDilation is held separately below.
   local lvl = SPD.level
-  spdSetGame(v, lvl == 2)
+  if presses > 0 or SPD.written == nil then spdSetGame(v, lvl == 2) end
   SPD.on = spdGameOn(v)
   local autoReady = false
   if lvl == SPD_Q then
     if not SPD.qStart then SPD.qStart, SPD.qClock = os.time(), now() end
     autoReady = spdAuto(v, true)                                      -- never accelerate a still-manual fight
+    if autoReady and not SPD.fast then SPD.progress = now(); spdReadActions(true) end
     spdMute(autoReady and SPD.mute)
-    if autoReady then
-      SPD.maxOrig = SPD.maxOrig or ws.MaxGlobalTimeDilation
-      if ws.MaxGlobalTimeDilation < SPD.qspeed then ws.MaxGlobalTimeDilation = SPD.qspeed end
-    end
   else
     spdMute(false)
     if SPD.qStart then
       SPD.qStart, SPD.qClock = nil, nil
       spdAuto(v, false)
-      if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig; SPD.maxOrig = nil end
+      SPD.progress = nil
     end
   end
-  local want = (lvl == SPD_Q) and (autoReady and SPD.qspeed or 1) or lvl
+  SPD.fast = lvl == SPD_Q and autoReady
+  if not SPD.fast then spdReleaseLimit(ws) end
+  local want = (lvl == SPD_Q) and (autoReady and spdQuickRate(ws) or 1) or lvl
   if math.abs(ws.TimeDilation - want) > 0.01 then
     if SPD.written then SPD.overwrites = SPD.overwrites + 1 end
     ws.TimeDilation = want
@@ -1982,6 +2576,123 @@ taskSpeed = function()
 end
 
 end -- speed scope
+
+local taskBulkSettings
+do
+local modes = {
+  BPCMP_BulkSelectionButton_Trading_C = {view="BPMV_Trading_C", file="bulk_trading.txt"},
+  BPCMP_BulkSelectionButton_Decmopo_C = {view="BPMV_Decompo_C", file="bulk_decompo.txt"}
+}
+local applying, hooked, warned = false, {}, {}
+for _, mode in pairs(modes) do
+  local quality, rank = (readFirst(mode.file) or ""):match("^v1|(%d+)|(%d+)%s*$")
+  quality, rank = tonumber(quality), tonumber(rank)
+  if quality and rank and quality <= 63 and rank <= 1023 and (quality == 0 or rank == 0) then mode.quality, mode.rank = quality, rank end
+end
+local function same(first, second)
+  return live(first) and live(second) and first:GetAddress() == second:GetAddress()
+end
+local function binding(button)
+  if not live(button) or button:HasAnyInternalFlags(EInternalObjectFlags.PendingKill) then return end
+  local mode = modes[button:GetClass():GetFName():ToString()]; if not mode then return end
+  local tree = button:GetOuter(); local view = live(tree) and tree:GetOuter()
+  if not live(view) or view:GetClass():GetFName():ToString() ~= mode.view then return end
+  local controller, _, _, instance = RUNTIME.player(); if not controller then return end
+  local owner = view:GetOwningPlayer()
+  if live(owner) then if not same(owner, controller) then return end
+  elseif not same(view:GetOuter(), instance) then return end
+  local panel = button.ListPanel
+  if live(panel) and same(panel:GetOuter(), tree) then return mode, panel end
+end
+local function group(list, button, count)
+  if not live(list) or not same(list.BtnMain, button) then return end
+  local rows = list.ListItems; if not rows or #rows ~= count then return end
+  local result = {mask=0}
+  for position = 1, count do
+    local item = rows[position]; if not live(item) then return end
+    local index = math.tointeger(item.DataIndex)
+    if not index or index < 0 or index >= count or result[index] then return end
+    local tree = item.WidgetTree; local root = live(tree) and tree.RootWidget
+    if not live(root) then return end
+    local mark
+    for child = 0, root:GetChildrenCount()-1 do
+      local widget = root:GetChildAt(child)
+      if live(widget) and widget:GetFName():ToString() == "IMG" then mark = widget; break end
+    end
+    if not mark then return end
+    local visibility = mark:GetVisibility()
+    if visibility ~= 2 and visibility ~= 3 then return end
+    if visibility == 3 then result.mask = result.mask | (1 << index) end
+    result[index] = {item=item, mark=mark}
+  end
+  return result
+end
+local function setGroup(rows, wanted, count)
+  for index = 0, count-1 do
+    local row = rows[index]
+    if (row.mark:GetVisibility() == 3) ~= ((wanted & (1 << index)) ~= 0) then row.item:HandleImgClicked() end
+  end
+end
+local function apply(button)
+  local mode, panel = binding(button); if not mode or mode.quality == nil then return end
+  local quality, rank = group(panel.List_Quality, button, 6), group(panel.List_Rank, button, 10)
+  if not quality or not rank or (quality.mask == mode.quality and rank.mask == mode.rank) then return end
+  applying = true
+  local ok, err = pcall(function()
+    if mode.rank == 0 then setGroup(rank, 0, 10); setGroup(quality, mode.quality, 6)
+    else setGroup(quality, 0, 6); setGroup(rank, mode.rank, 10) end
+  end)
+  applying = false
+  if not ok then error(err) end
+end
+local function flush(mode)
+  if mode.dirty and writeFile(mode.file, string.format("v1|%d|%d\n", mode.quality, mode.rank)) then mode.dirty = false end
+end
+local function userChanged(context)
+  local item = context:get(); if not live(item) then return end
+  local tree = item:GetOuter(); local list = live(tree) and tree:GetOuter()
+  if not live(list) then return end
+  local button = list.BtnMain; local mode, panel = binding(button); if not mode then return end
+  local quality, rank = group(panel.List_Quality, button, 6), group(panel.List_Rank, button, 10)
+  if not quality or not rank or (quality.mask ~= 0 and rank.mask ~= 0) then return end
+  local source = same(list, panel.List_Quality) and quality or same(list, panel.List_Rank) and rank
+  local row = source and source[item.DataIndex]; if not row or not same(row.item, item) then return end
+  if mode.quality ~= quality.mask or mode.rank ~= rank.mask then
+    mode.quality, mode.rank, mode.dirty = quality.mask, rank.mask, true; flush(mode)
+  end
+end
+local function fromButton(context) apply(context:get()) end
+local function fromArgument(context, button) apply(button:get()) end
+local function fromList(context) local list = context:get(); if live(list) then apply(list.BtnMain) end end
+local hooks = {
+  {"BulkSelectionItem:HandleImgClicked", userChanged, true},
+  {"BulkSelectionItemList:EstablishItems", fromList, true},
+  {"BulkSelectionListPanel:SetMainButton", fromArgument, true},
+  {"BulkSelectionButton:HandleBtn_Expand", fromButton, true},
+  {"JHNeoUITradingVM:BulkSellItems", fromArgument},
+  {"JHNeoUIDecompoVM:BulkPutItems", fromArgument}
+}
+local function noop() end
+taskBulkSettings = function()
+  for _, mode in pairs(modes) do flush(mode) end
+  for _, hook in ipairs(hooks) do
+    local name, handler, after = table.unpack(hook)
+    if not hooked[name] then
+      local path = "/Script/JH." .. name
+      local method = StaticFindObject(path)
+      if method and method:IsValid() then
+        local function invoke(...)
+          if applying then return end
+          local ok, err = pcall(handler, ...)
+          if not ok and not warned[name] then warned[name] = true; print("[GamepadTweaks] bulk settings: " .. name .. ": " .. tostring(err) .. "\n") end
+        end
+        hooked[name] = pcall(RegisterHook, path, after and noop or invoke, after and invoke or nil)
+      end
+    end
+  end
+end
+taskBulkSettings()
+end
 
 -- ---------------------------------------------------------------- scheduler (20 ms tick)
 -- base tick 20 ms (one game-thread loop for everything; "every" is in ticks)
@@ -1995,19 +2706,53 @@ local tasks = {
   { every = 10,  fn = taskScan },
   { every = 150, fn = taskInteract },
   { every = 15,  fn = taskBattle },
-  { every = 10,  fn = taskBackpack },
-  { every = 1,   fn = taskHide },
   { every = 1,   fn = taskPadEv },
   { every = 1,   fn = taskStart },
   { every = 1,   fn = taskNav },
   { every = 1,   fn = taskObs },
+  { every = 10,  fn = taskBackpack },
+  { every = 1,   fn = taskHide },
   { every = 1,   fn = taskSpeed },
   { every = 50,  fn = taskAutoSave },
   { every = 1,   fn = taskWalkAppearance },
   { every = 5,   fn = taskGift },
+  { every = 50,  fn = taskBulkSettings },
 }
 local tick = 0
 local errCount = {}
+function RUNTIME.leaveMap(level)
+  local sameLevel = level and level:GetAddress() == RUNTIME.playing
+  if sameLevel and inFight then WALK.afterFight = true end
+  RUNTIME.playing, RUNTIME.events = false, 0
+  RUNTIME.endSpeed(level)
+  inFight, inBattle, lastBattle, ground.lv, pendingTravel = false, false, nil, nil, nil
+  if lastMap ~= "0" and writeFile("map.flag", "0") then lastMap = "0" end
+  writeBattleFlag()
+  if START.pending then writeFile("start.ack", "0") end
+  START.pending, START.vm, PRIMEWATCH.vis = nil, nil, false
+  if arrival and (arrival.ready or not arrival.source) then arrival = nil end
+  NAV.open, NAV.team, NAV.vm, NAV.views, NAV.im, NAV.sideCell, NAV.cells = false, nil, nil, nil, nil, nil, nil
+  OBS.open, OBS.view, OBS.vm, OBS.bpView, OBS.grid, OBS.btn = false, nil, nil, nil, nil, nil
+  MASKS.prime, MASKS.obs, PADEV = 0, 0, nil; navMask(0)
+  BAG.observing, BAG.observedGrid, BAG.hidden, BAG.filtered = false, nil, {}, {}
+  GIFT.vm, GIFT.root, GIFT.view, GIFT.grid, GIFT.nextRead = nil, nil, nil, nil, 0
+  HIDE.vm, HIDE.root, HIDE.view, HIDE.grid, HIDE.info, HIDE.open, bp.open, bp.lit = nil, nil, nil, nil, {}, false, false, {}
+  if not sameLevel then lastLevel, WALK.pawn, WALK.team, WALK.originals = nil, nil, nil, {} end
+end
+if RegisterLoadMapPreHook and RegisterLoadMapPostHook then
+  RegisterLoadMapPostHook(function(engine, worldParam)
+    RUNTIME.loading = false
+    if RUNTIME.owner and arrival then
+      local world = worldParam:get()
+      if not live(world) or world:GetFName():ToString() ~= arrival.lv then arrival = nil end
+    end
+  end)
+  RegisterLoadMapPreHook(function()
+    if RUNTIME.owner and RUNTIME.playing then pcall(RUNTIME.beforeSpeedMap) end
+    RUNTIME.loading = true
+    if RUNTIME.owner and RUNTIME.playing then RUNTIME.leaveMap(nil) end
+  end)
+end
 os.remove(DIR .. "teleport.req") -- do not replay requests from an earlier session
 writeFile("map.flag", "0")
 writeFile("battle.flag", "0")
@@ -2017,7 +2762,21 @@ LoopInGameThreadWithDelay(20, function()
   if not runtimePoll() then return end
   if tick == 0 then print("[GamepadTweaks] scheduler: owner tick active\n") end
   tick = tick + 1
+  local checked, controller, _, _, _, level = pcall(RUNTIME.player)
+  if not checked or not controller then
+    if RUNTIME.playing then RUNTIME.leaveMap(checked and level or nil) end
+    if not checked and not RUNTIME.playerError then
+      RUNTIME.playerError = true; print("[GamepadTweaks] player not ready: " .. tostring(controller) .. "\n")
+    end
+    if not RUNTIME.loading and tick % 50 == 0 then pcall(taskCmd) end
+    return
+  end
+  RUNTIME.playerError = nil
+  local address = level:GetAddress()
+  if RUNTIME.playing and RUNTIME.playing ~= address then RUNTIME.leaveMap(nil) end
+  RUNTIME.playing = address
   for i, t in ipairs(tasks) do
+    if not RUNTIME.playing or RUNTIME.loading then break end
     if tick % t.every == 0 then
       local ok, err = pcall(t.fn)
       if not ok then

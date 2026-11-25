@@ -32,9 +32,10 @@ UE4SS ──Lua──> GamepadTweaks/Scripts/main.lua（src/lua）──反射�
 | `battle.flag` | Lua | `1` = 战斗中（DLL 完全放行手柄、隐藏自绘指针） |
 | `ptr.flag` | DLL | `1` = 4 秒内用过右摇杆（Lua 只在此时扫描 UI） |
 | `cur.txt` | Lua | 当前关卡名，如 `LV_25_P` |
-| `visited.txt` | Lua | `关卡|x|y|z`，该关卡最近一次站在地面上的位置（安全落点） |
+| `visited.txt` | Lua | 已到访关卡；旧 `关卡|x|y|z` 行继续解锁，坐标不用于传送 |
 | `places.txt` | 仓库 data/ | `区域\t名称\t关卡,关卡\t驿站关卡\t驿站坐标` |
-| `teleport.req` | DLL | `关卡|x|y|z`，Lua 读取后删除并执行 |
+| `landings.txt` | 仓库 data/ | 每行依次为关卡、原版入口、类别、客栈门外、住宿 NPC 及位置，制表符分隔 |
+| `teleport.req` | DLL | 目标关卡名；Lua 读取后删除，只按本地固定落点表执行 |
 | `scan_in.txt` / `scan_mid.txt` / `scan_ok.txt` | Lua/DLL | UI 扫描的两阶段交接（见 wsmod.cpp 注释） |
 | `cmd.lua` → `cmd_out.txt` | 开发者 | 维护通道：Lua 每秒检查，存在就在游戏线程执行一次并删除，`W(...)` 写输出 |
 | `npc_override.txt` | 开发者 | 测试用，强制背包逻辑把当前角色当成该 NPC id |
@@ -123,7 +124,7 @@ powershell -File tools\install.ps1
 - DATA 目录和游戏路径写死在 `wsmod.cpp`（`DATA_DIR`）和 `main.lua`（`DIR`、`DLLPATH`），换机器要改；可以改成从 DLL 所在目录推导。
 - `ProcessEvent` RVA 按版本写死（见规则 5）。
 - 战斗判定依赖 `BP_FightSpectator_C` 作为 pawn 或战斗技能栏出现，特殊战斗（切磋、擂台、小游戏）未逐一验证。
-- 传送用 `AsyncTaskChangeSceneMap.ChangeSceneMap`，跳过剧情触发可能卡任务；已在战斗、对话、加载时禁止。落地保护（`taskArrival`）兜底：下坠/掉出地图时送回 PlayerStart。
+- 跨图传送用 `AsyncTaskChangeSceneMap.ChangeSceneMap` 进原版入口；`taskArrival` 只在目标世界检查地面、导航和可走出的路线，再定位到客栈、掌柜或入口。同图不重新加载。
 - 掉出地图后游戏会销毁角色（日志 `is outside the world bounds`），此时 `pc.Pawn` 为空，用 `ChangeSceneMap` 回到该图的 PlayerStart 可以恢复（2026-11-22 实际救援过一次）。
 - 装备属性 = **物品表 `Items` 行的 `Actions`（基础值）+ `ItemInfoSpec.Actions`/`RandActions`（这一件的随机加成）**，只取 `CAttr(4)`；结果与游戏提示框一致（例：亮银甲 44.2+3 → 显示 47）。只比加成会严重误判（v4.4 及以前的 bug）。不考虑特效 buff；属性 ID 与中文名的对应尚未整理（已知 11=防御力、2=气血上限）。
 - `GetDef()` 返回的是 Lua table，其中 `Actions` 也是 table，用 `:ForEach` 会静默失败；读基础属性请直接遍历数据表。

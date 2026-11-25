@@ -29,7 +29,7 @@
 
 - 世界地图界面：`BPMV_JHNeoUIWorldMap3_C`（父类 `JHNeoUIWorldMapViewBase`，有 `MaxScale=2`、`MoveKeys=WASD`、`GamepadScaleSpeed` 等）。
 - 换图：`/Script/JH.Default__AsyncTaskChangeSceneMap`
-  `ChangeSceneMap(WorldContext, FName 关卡, FVector 位置, 朝向枚举, bPlayIntoSceneAnim, bPlayShowSceneAnim, bShowHUDOnChanged, bShowGlobalLoading, bReadSaveData)` 返回 task，再调 `task:StartChangeMap()`。
+  `ChangeSceneMap(WorldContext, FName 关卡, FVector 位置, 朝向枚举, bPlayIntoSceneAnim, bPlayShowSceneAnim, bShowHUDOnChanged, bShowGlobalLoading, bReadSaveData)` 自己开始加载，不再调用 `StartChangeMap()`。
   另有 `ChangeSceneMapWithId(…, MapId, …)`。
 - 数据表 `…/Tables/Maps.Maps`：`MapId, MapName(关卡名), ViewName(中文名), bInCave, WorldMapPosX/Y, …`。MapId 段落：9–99 与 1000+ 中原，200 段北地，300 段关外，400 段西域，600 段海外，900 段南疆。
 - 数据表 `…/Tables/CourierStation.CourierStation`：`ID, DisplayName, Region(ECourierStationRegion), MapId, Price, TeleportationX/Y/Z, Requirements, NPCId`，共 15 个驿站。
@@ -85,6 +85,7 @@
 - 上一场的 `BPMV_JHBattleModule_C` 实例可能还在，要取**可见**的那个。
 - 结算：胜利 `BPMV_BattleWinMaster_C`（VM `JHNeoUIBattleResultVM:HandleModuleClose()` 关闭），失败 `BPMV_BattleFailure_C`（按钮事件 `BndEvt__BPMV_BattleFailure_NeoUIButtonBase_76_..._OnButtonClickedEvent__DelegateSignature`）。
 - `FightManager`：`HandlePawnTurnStart`、`ActionWinLose(Type)`、`TurnManager`。战斗界面还有 `EVT_UpdateSkipButtonVisibility` / `BTN_SkipArena`（擂台跳过，未研究）。
+- v1.24.32 的 `ExecuteUbergraph_GA_Base` 在回调标识 `-1255582134` / `819583215` 等待「定屏慢放等待时间」/「受击慢放延时」。绝招定屏时先 `SetGamePaused(true)`，随后在同一段同步代码把「大招定屏后」及「定屏总耗时」交给出招者的 `JHAbilitySystemComponent:AddDelayCallback`。速战只改这些演出等待的时长，不调用回调，也不调用 `EndTurnForAbility` 或 `ActionWinLose`。
 - 人物界面切磋：`BPMV_PrimeTeam_C` 的 `BndEvt__BPMV_PrimeTeam_BTN_QieCuo_K2Node_ComponentBoundEvent_2_BtnClick__DelegateSignature`（需选中队友）。
 
 ## 观察界面（2026-11-23 实测）

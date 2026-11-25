@@ -14,7 +14,7 @@ $dll = Join-Path $root 'build\xinput1_3.dll'
 if (-not (Test-Path $dll)) { throw "build\xinput1_3.dll missing - run tools\build.bat first" }
 
 # Fail before copying the DLL if a release was unpacked incompletely.
-foreach ($required in @('src\lua\main.lua','data\places.txt','data\wsmod.ini')) {
+foreach ($required in @('src\lua\main.lua','data\places.txt','data\landings.txt','data\wsmod.ini')) {
   if (-not (Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Missing release file: $required" }
 }
 if (Get-Process -Name JH,JH-Win64-Shipping -ErrorAction SilentlyContinue) { throw 'Exit the game normally before installing.' }
@@ -59,9 +59,11 @@ if (-not (Test-Path -LiteralPath $modsTxt) -or -not (Select-String $modsTxt -Pat
 
 # data: keep the user's existing configuration
 New-Item -ItemType Directory -Force $Data | Out-Null
-$places = Join-Path $Data 'places.txt'
-BackupFile $places 'data\places.txt'
-Copy-Item (Join-Path $root 'data\places.txt') $places -Force
+foreach ($name in @('places.txt','landings.txt')) {
+  $destination = Join-Path $Data $name
+  BackupFile $destination (Join-Path 'data' $name)
+  Copy-Item -LiteralPath (Join-Path $root "data\$name") -Destination $destination -Force
+}
 if (-not (Test-Path (Join-Path $Data 'wsmod.ini'))) { Copy-Item (Join-Path $root 'data\wsmod.ini') (Join-Path $Data 'wsmod.ini') }
 if (-not (Test-Path (Join-Path $Data 'cursor.png'))) { Write-Warning 'cursor.png missing - run tools\extract_cursor.ps1 (pointer overlay will be invisible without it)' }
 if ($NoBackup) { 'installed (log windows hidden). backup skipped by request.' }

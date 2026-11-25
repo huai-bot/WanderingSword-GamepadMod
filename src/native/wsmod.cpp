@@ -21,6 +21,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <map>
 
 #define DATA_DIR L"D:\\TOOLS\\AWSdata\\WanderingSword\\"
 
@@ -164,7 +165,42 @@ static void LoadConfig() {
 }
 
 // ============================================================ shared state
-static volatile LONG g_primary = -1;
+static LONG PrimaryController() {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static LONG primary = -1;
+    static ULONGLONG nextScan = 0;
+    AcquireSRWLockExclusive(&lock);
+    const ULONGLONG now = GetTickCount64();
+    if (pGetState && now >= nextScan) {
+        nextScan = now + 750;
+        XINPUT_STATE probe{};
+        if (primary < 0 || pGetState(static_cast<DWORD>(primary), &probe) != ERROR_SUCCESS) {
+            LONG selected = -1;
+            for (DWORD slot = 0; slot < XUSER_MAX_COUNT; ++slot) {
+                if (static_cast<LONG>(slot) != primary && pGetState(slot, &probe) == ERROR_SUCCESS) {
+                    selected = static_cast<LONG>(slot); break;
+                }
+            }
+            if (selected != primary) {
+                primary = selected;
+                if (primary >= 0) Log("controller at index %ld -> player 1", primary);
+                else Log("player 1 controller disconnected");
+            }
+        }
+    }
+    const LONG selected = primary;
+    ReleaseSRWLockExclusive(&lock);
+    return selected;
+}
+static DWORD ControllerSlot(DWORD index, LONG primary) {
+    if (primary <= 0) return index;
+    const DWORD physical = static_cast<DWORD>(primary);
+    if (index == 0) return physical;
+    return index == physical ? 0 : index;
+}
+static DWORD ControllerSlot(DWORD index) {
+    return index < XUSER_MAX_COUNT ? ControllerSlot(index, PrimaryController()) : index;
+}
 static volatile LONG g_mapOpen = 0;
 static volatile LONG g_battle = 0;    // in battle: everything native, mod pointer off
 static volatile LONG g_fight = 0;     // a real fight (fight.flag): Start stays native. battle.flag is also 1 on the overworld / loading
@@ -173,8 +209,8 @@ static volatile LONG g_fight = 0;     // a real fight (fight.flag): Start stays 
 // trig.req ("L"/"R" = LT/RT, "<" ">" "^" "v" = d-pad or left stick), Lua then jumps itself -> no flash.
 enum { NAV_UP = 1, NAV_DOWN = 2, NAV_LEFT = 4, NAV_RIGHT = 8, NAV_TRIG = 16 };
 static volatile LONG g_navMask = 0, g_navStage = 0; static volatile DWORD g_navTime = 0;
-static volatile LONG g_ev[7];          // L R < > ^ v Y (battle speed)
-static const char EV_CH[7] = { 'L', 'R', '<', '>', '^', 'v', 'Y' };
+static const char EV_CH[] = { 'L', 'R', '<', '>', '^', 'v' };
+static volatile LONG g_ev[_countof(EV_CH)];
 // Lua arms the single-Y shortcut only while a real fight is active. A stopped loop restores native input.
 extern "C" __declspec(dllexport) int wsmod_speed_input_0(void* lua) { RuntimeInput(lua, false); return 0; }
 extern "C" __declspec(dllexport) int wsmod_speed_input_1(void* lua) { RuntimeInput(lua, true); return 0; }
@@ -480,11 +516,11 @@ static DWORD WINAPI MouseThread(LPVOID) {
     for (;;) {
         Sleep(8);
         DWORD now = GetTickCount(); double dt = (now - last) / 1000.0; last = now; if (dt > 0.05) dt = 0.05;
-        { LONG any = 0, n[7];
-          for (int k = 0; k < 7; k++) { n[k] = InterlockedExchange(&g_ev[k], 0); any |= n[k]; }
+        { LONG any = 0, n[_countof(EV_CH)];
+          for (size_t k = 0; k < _countof(n); k++) { n[k] = InterlockedExchange(&g_ev[k], 0); any |= n[k]; }
           if (any) {
             FILE* tf = nullptr;
-            if (_wfopen_s(&tf, DATA_DIR L"trig.req", L"ab") == 0 && tf) { for (int k = 0; k < 7; k++) for (LONG i = 0; i < n[k]; i++) fputc(EV_CH[k], tf); fclose(tf); }
+            if (_wfopen_s(&tf, DATA_DIR L"trig.req", L"ab") == 0 && tf) { for (size_t k = 0; k < _countof(n); k++) for (LONG i = 0; i < n[k]; i++) fputc(EV_CH[k], tf); fclose(tf); }
           } }
         if ((++n % 6) == 0) {
             std::wstring s = ReadSmallFile(L"map.flag");
@@ -498,7 +534,7 @@ static DWORD WINAPI MouseThread(LPVOID) {
             if (nf != g_fight) { g_fight = nf; Log("fight %s: Start %s", nf ? "start" : "end", nf ? "native" : "-> character screen"); }
         }
         bool active = GameFocused() && !g_mapOpen && !g_menuOpen && !g_battle;
-        LONG idx = g_primary; XINPUT_STATE st{};
+        LONG idx = active ? PrimaryController() : -1; XINPUT_STATE st{};
         // pointer flag for the Lua scanner (only scan the UI while the pointer is in use)
         { LONG want = (GetTickCount() - g_lastStick < 4000 && active) ? 1 : 0;
           if (want != g_ptrActive) { g_ptrActive = want; FILE* pf = nullptr; if (_wfopen_s(&pf, DATA_DIR L"ptr.flag", L"wb") == 0 && pf) { fputc(want ? '1' : '0', pf); fclose(pf); } } }
@@ -542,9 +578,7 @@ static const int COLS = 4, ROWS = 7;
 struct Place {
     std::wstring region, name; std::vector<std::wstring> levels;
     wchar_t initial = L'#';
-    std::wstring stLv; double sx = 0, sy = 0, sz = 0; bool hasSt = false;
-    // resolved
-    bool visited = false, current = false; std::wstring tLv; double tx = 0, ty = 0, tz = 0;
+    bool visited = false, current = false; std::wstring tLv, landing;
 };
 static const wchar_t* REGIONS[6] = { L"中原", L"西域", L"关外", L"南疆", L"北地", L"海外" };
 static std::vector<Place> g_all;
@@ -575,34 +609,38 @@ static std::vector<std::wstring> Split(const std::wstring& s, wchar_t d) {
     return r;
 }
 static void LoadPlaces() {
+    static std::map<std::wstring, std::wstring> anchors;
     if (g_all.empty()) {
+        for (const auto& row : Split(ReadSmallFile(L"landings.txt"), L'\n')) {
+            auto fields = Split(row, L'\t');
+            if (fields.size() >= 5) anchors[fields[0]] = fields[2];
+        }
         std::wstring all = ReadSmallFile(L"places.txt");
         for (auto& line : Split(all, L'\n')) {
             if (line.empty()) continue;
             auto c = Split(line, L'\t'); if (c.size() < 3) continue;
             Place p; p.region = c[0]; p.name = c[1]; p.initial = PlaceInitial(p.name); p.levels = Split(c[2], L',');
-            if (c.size() >= 5 && !c[3].empty()) { p.stLv = c[3]; p.hasSt = swscanf_s(c[4].c_str(), L"%lf,%lf,%lf", &p.sx, &p.sy, &p.sz) == 3; }
             g_all.push_back(p);
         }
         Log("places loaded: %d", (int)g_all.size());
     }
-    // visited levels with first-entry positions
-    struct V { std::wstring lv; double x, y, z; };
-    std::vector<V> vis;
+    std::vector<std::wstring> vis;
     for (auto& line : Split(ReadSmallFile(L"visited.txt"), L'\n')) {
-        auto c = Split(line, L'|'); if (c.size() < 4) continue;
-        V v{ c[0], _wtof(c[1].c_str()), _wtof(c[2].c_str()), _wtof(c[3].c_str()) }; vis.push_back(v);
+        auto level = line.substr(0, line.find_first_of(L"|\r"));
+        if (!level.empty()) vis.push_back(level);
     }
     g_curLv = ReadSmallFile(L"cur.txt"); while (!g_curLv.empty() && iswspace(g_curLv.back())) g_curLv.pop_back();
     for (int r = 0; r < 6; r++) { g_list[r].clear(); g_total[r] = g_visited[r] = 0; }
     for (int i = 0; i < (int)g_all.size(); i++) {
-        Place& p = g_all[i]; p.visited = false; p.current = false;
+        Place& p = g_all[i]; p.visited = false; p.current = false; p.tLv.clear(); p.landing.clear();
         for (auto& lv : p.levels) if (lv == g_curLv) p.current = true;
-        const V* landing = nullptr;
-        for (auto& lv : p.levels) for (auto& v : vis) if (v.lv == lv && (!landing || (p.hasSt && lv == p.stLv))) landing = &v;
-        if (landing) {
-            // Prefer the station's LEVEL, never its unverified XYZ (e.g. underground in Pingkang).
-            p.visited = true; p.tLv = landing->lv; p.tx = landing->x; p.ty = landing->y; p.tz = landing->z;
+        int best = -1;
+        for (const auto& level : p.levels) {
+            if (std::find(vis.begin(), vis.end(), level) == vis.end()) continue;
+            p.visited = true;
+            auto anchor = anchors.find(level); if (anchor == anchors.end()) continue;
+            int rank = level == g_curLv ? 3 : anchor->second == L"inn" ? 2 : anchor->second == L"keeper" ? 1 : 0;
+            if (rank > best) { best = rank; p.tLv = level; p.landing = anchor->second; }
         }
         for (int r = 0; r < 6; r++) if (p.region == REGIONS[r]) {
             g_list[r].push_back(i); g_total[r]++; if (p.visited) g_visited[r]++;
@@ -680,17 +718,17 @@ static void DrawPanel(HDC dc) {
         for (int c = 0; c < (int)row.items.size(); ++c) {
         int i = row.items[c];
         Place& p = g_all[L[i]]; RECT r = CellRect(vr * COLS + c); bool sel = i == g_sel;
-        bool locked = !p.visited, selected = sel && !locked;
+        bool locked = p.tLv.empty(), selected = sel && !locked;
         Fill(dc, r, selected ? GOLD : (locked ? RGB(29, 27, 25) : RGB(40, 35, 29)));
         Frame(dc, r, sel ? (locked ? DIM : RGB(250, 220, 150)) : RGB(84, 70, 46), sel ? 2 : 1);
         RECT tr = r; tr.left += 16; tr.right -= 10;
         RECT nameRect = tr;
-        if (locked || p.current || (p.hasSt && p.tLv == p.stLv)) nameRect.right -= locked ? 62 : 42;
+        nameRect.right -= locked ? 62 : 42;
         COLORREF tc = locked ? RGB(105, 100, 94) : (selected ? RGB(24, 18, 8) : (p.current ? DIM : INK));
         Text(dc, p.name, nameRect, tc, fCell, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
-        if (locked) Text(dc, L"未解锁", tr, DIM, fHint, DT_RIGHT | DT_VCENTER);
+        if (locked) Text(dc, p.visited ? L"无入口" : L"未解锁", tr, DIM, fHint, DT_RIGHT | DT_VCENTER);
         else if (p.current) Text(dc, L"当前", tr, selected ? RGB(60, 44, 20) : GOLD, fHint, DT_RIGHT | DT_VCENTER);
-        else if (p.hasSt && p.tLv == p.stLv) Text(dc, L"驿站", tr, selected ? RGB(60, 44, 20) : DIM, fHint, DT_RIGHT | DT_VCENTER);
+        else Text(dc, p.landing == L"inn" ? L"客栈" : p.landing == L"keeper" ? L"掌柜" : L"入口", tr, selected ? RGB(60, 44, 20) : DIM, fHint, DT_RIGHT | DT_VCENTER);
         }
     }
     int rowsTotal = (int)rows.size();
@@ -713,18 +751,18 @@ static void DoTeleport() {
     auto& L = g_list[g_tab]; if (g_sel < 0 || g_sel >= (int)L.size()) return;
     Place& p = g_all[L[g_sel]];
     if (!p.visited) { Toast(L"此地点尚未解锁，到访后才能传送"); InvalidateRect(g_menuWnd, nullptr, FALSE); return; }
-    if (p.current) { Toast(L"你已经在这里了"); InvalidateRect(g_menuWnd, nullptr, FALSE); return; }
+    if (p.tLv.empty()) { Toast(L"此地点没有可确认的安全入口"); InvalidateRect(g_menuWnd, nullptr, FALSE); return; }
     char lv[128] = {};
     FILE* f = nullptr;
     bool sent = false;
     if (WideCharToMultiByte(CP_UTF8, 0, p.tLv.c_str(), -1, lv, sizeof(lv), nullptr, nullptr) &&
         _wfopen_s(&f, DATA_DIR L"teleport.tmp", L"wb") == 0 && f) {
-        bool wrote = fprintf(f, "%s|%.0f|%.0f|%.0f\n", lv, p.tx, p.ty, p.tz) > 0;
+        bool wrote = fprintf(f, "%s\n", lv) > 0;
         bool closed = fclose(f) == 0;
         sent = wrote && closed && MoveFileExW(DATA_DIR L"teleport.tmp", DATA_DIR L"teleport.req", 0);
     }
     if (!sent) { Toast(L"传送请求未送出，请稍后再试"); InvalidateRect(g_menuWnd, nullptr, FALSE); return; }
-    Log("teleport request %s %.0f %.0f %.0f", lv, p.tx, p.ty, p.tz);
+    Log("teleport to fixed anchor: %s", lv);
     g_menuOpen = 0; ShowWindow(g_menuWnd, SW_HIDE);
 }
 static void Move(int dx, int dy) {
@@ -1087,25 +1125,6 @@ static void PadMenu(const XINPUT_GAMEPAD& g) {
     if (dir != g_repDir) { g_repDir = dir; g_repT = now + 320; if (dir) MenuCmd(dir); }
     else if (dir && now >= g_repT) { g_repT = now + 110; MenuCmd(dir); }
 }
-// View(Back) + D-pad adjusts mouse speed. Back is held back from the game while pressed;
-// a plain tap (no D-pad used) is replayed to the game on release, so the world map still opens.
-static bool g_backHeld, g_backUsed; static DWORD g_backInjectUntil, g_adjT; static int g_adjDir;
-static void PadSpeedCombo(XINPUT_GAMEPAD& g) {
-    const WORD DP = XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT;
-    DWORD now = GetTickCount(); WORD b = g.wButtons;
-    if (b & XINPUT_GAMEPAD_BACK) {
-        if (!g_backHeld) { g_backHeld = true; g_backUsed = false; g_adjDir = 0; }
-        int dir = 0;
-        if (b & XINPUT_GAMEPAD_DPAD_UP) dir = 50; else if (b & XINPUT_GAMEPAD_DPAD_DOWN) dir = -50;
-        else if (b & XINPUT_GAMEPAD_DPAD_RIGHT) dir = 200; else if (b & XINPUT_GAMEPAD_DPAD_LEFT) dir = -200;
-        if (dir != g_adjDir) { g_adjDir = dir; g_adjT = now + 350; if (dir) { AdjustSpeed(dir); g_backUsed = true; } }
-        else if (dir && now >= g_adjT) { g_adjT = now + 90; AdjustSpeed(dir); }
-        g.wButtons &= ~(XINPUT_GAMEPAD_BACK | DP);
-    } else {
-        if (g_backHeld) { g_backHeld = false; g_adjDir = 0; if (!g_backUsed) g_backInjectUntil = now + 120; }
-        if (now < g_backInjectUntil) g.wButtons |= XINPUT_GAMEPAD_BACK;
-    }
-}
 // Start opens the character screen (keyboard B) instead of the system menu.
 static DWORD WINAPI KeyTapThread(LPVOID p) {
     WORD sc = (WORD)(UINT_PTR)p;
@@ -1195,19 +1214,19 @@ static void PadBattleSpeed(XINPUT_GAMEPAD& g, bool active) { RuntimeBattleY(g, a
 static void ReleaseClick() { if (g_aClick) { MouseBtn(false); g_aClick = false; } }
 static DWORD Handle(PFN_GetState fn, DWORD idx, XINPUT_STATE* s) {
     if (!fn) return ERROR_DEVICE_NOT_CONNECTED;
-    DWORD r = fn(idx, s);
-    if (r != ERROR_SUCCESS || !s) return r;
-    if (g_primary < 0) { g_primary = (LONG)idx; Log("controller at index %u", idx); }
-    if ((LONG)idx != g_primary) return r;
+    DWORD r = fn(ControllerSlot(idx), s);
+    if (r != ERROR_SUCCESS || !s || idx != 0) return r;
     XINPUT_GAMEPAD& g = s->Gamepad;
     bool focus = GameFocused();
-    bool openMapPanel = g_mapPress.sample(g, focus && !g_fight, g_mapOpen != 0, g_menuOpen != 0, GetTickCount());
+    auto view = g_mapPress.sample(*s, focus, g_fight != 0, g_mapOpen != 0, g_menuOpen != 0, GetTickCount());
+    if (view.speed) AdjustSpeed(view.speed);
+    if (view.nativeTap) Log("View -> native map tap");
     PadBattleSpeed(g, focus && !g_menuOpen && !g_mapOpen); // confirmed map owns Y
     if (focus && !g_menuOpen) PadPrime(g);
     // the world map cannot be open during a real fight, but battle.flag is also 1 on the overworld (LV_World):
     // map state wins, so Y / the teleport panel work when the map is opened from the overworld
-    if (focus && (!g_battle || g_mapOpen || g_menuOpen)) { if (!g_menuOpen) PadSpeedCombo(g); PadMenu(g); }
-    if (openMapPanel) MenuCmd(CMD_OPEN);
+    if (focus && (!g_battle || g_mapOpen || g_menuOpen)) PadMenu(g);
+    if (view.panel) MenuCmd(CMD_OPEN);
     if (g_menuOpen) { ReleaseClick(); ZeroMemory(&g, sizeof(g)); return r; }                    // panel owns the pad
     if (g_mapOpen) { ReleaseClick(); g.wButtons &= ~XINPUT_GAMEPAD_Y; return r; }               // map: native except Y
     if (g_battle) {                                                                              // battle: all native...
@@ -1238,7 +1257,7 @@ static BOOL CALLBACK InitReal(PINIT_ONCE, PVOID, PVOID*) {
     p102 = (PFN_1DW)GetProcAddress(g_real, (LPCSTR)102);
     p103 = (PFN_1DW)GetProcAddress(g_real, (LPCSTR)103);
     LoadConfig();
-    Log("wsmod loaded v4.30 (pid=%lu dll=%p speed %.0f, deadzone %.0f)", GetCurrentProcessId(), g_self, CFG_SPEED, CFG_DEADZONE);
+    Log("wsmod loaded v4.37 (pid=%lu dll=%p speed %.0f, deadzone %.0f)", GetCurrentProcessId(), g_self, CFG_SPEED, CFG_DEADZONE);
     CreateThread(nullptr, 0, CursorThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, MenuThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, MouseThread, nullptr, 0, nullptr);
@@ -1251,15 +1270,21 @@ static void Init() { InitOnceExecuteOnce(&g_once, InitReal, nullptr, nullptr); }
 extern "C" {
 DWORD WINAPI Proxy_XInputGetState(DWORD i, XINPUT_STATE* s) { Init(); return Handle(pGetState, i, s); }
 DWORD WINAPI Proxy_GetStateEx(DWORD i, XINPUT_STATE* s) { Init(); return Handle(pGetStateEx ? pGetStateEx : pGetState, i, s); }
-DWORD WINAPI Proxy_XInputSetState(DWORD i, XINPUT_VIBRATION* v) { Init(); return pSetState ? pSetState(i, v) : ERROR_DEVICE_NOT_CONNECTED; }
-DWORD WINAPI Proxy_XInputGetCapabilities(DWORD i, DWORD f, XINPUT_CAPABILITIES* c) { Init(); return pGetCaps ? pGetCaps(i, f, c) : ERROR_DEVICE_NOT_CONNECTED; }
+DWORD WINAPI Proxy_XInputSetState(DWORD index, XINPUT_VIBRATION* vibration) { Init(); return pSetState ? pSetState(ControllerSlot(index), vibration) : ERROR_DEVICE_NOT_CONNECTED; }
+DWORD WINAPI Proxy_XInputGetCapabilities(DWORD index, DWORD flags, XINPUT_CAPABILITIES* caps) { Init(); return pGetCaps ? pGetCaps(ControllerSlot(index), flags, caps) : ERROR_DEVICE_NOT_CONNECTED; }
 void  WINAPI Proxy_XInputEnable(BOOL e) { Init(); if (pEnable) pEnable(e); }
-DWORD WINAPI Proxy_XInputGetDSoundAudioDeviceGuids(DWORD i, GUID* a, GUID* b) { Init(); return pGetDS ? pGetDS(i, a, b) : ERROR_DEVICE_NOT_CONNECTED; }
-DWORD WINAPI Proxy_XInputGetBatteryInformation(DWORD i, BYTE t, XINPUT_BATTERY_INFORMATION* b) { Init(); return pGetBat ? pGetBat(i, t, b) : ERROR_DEVICE_NOT_CONNECTED; }
-DWORD WINAPI Proxy_XInputGetKeystroke(DWORD i, DWORD r, PXINPUT_KEYSTROKE k) { Init(); return pGetKey ? pGetKey(i, r, k) : ERROR_EMPTY; }
-DWORD WINAPI Proxy_101(DWORD a, DWORD b, void* c) { Init(); return p101 ? p101(a, b, c) : ERROR_DEVICE_NOT_CONNECTED; }
-DWORD WINAPI Proxy_102(DWORD a) { Init(); return p102 ? p102(a) : ERROR_DEVICE_NOT_CONNECTED; }
-DWORD WINAPI Proxy_103(DWORD a) { Init(); return p103 ? p103(a) : ERROR_DEVICE_NOT_CONNECTED; }
+DWORD WINAPI Proxy_XInputGetDSoundAudioDeviceGuids(DWORD index, GUID* render, GUID* capture) { Init(); return pGetDS ? pGetDS(ControllerSlot(index), render, capture) : ERROR_DEVICE_NOT_CONNECTED; }
+DWORD WINAPI Proxy_XInputGetBatteryInformation(DWORD index, BYTE type, XINPUT_BATTERY_INFORMATION* battery) { Init(); return pGetBat ? pGetBat(ControllerSlot(index), type, battery) : ERROR_DEVICE_NOT_CONNECTED; }
+DWORD WINAPI Proxy_XInputGetKeystroke(DWORD index, DWORD reserved, PXINPUT_KEYSTROKE key) {
+    Init(); if (!pGetKey) return ERROR_EMPTY;
+    const LONG primary = PrimaryController();
+    const DWORD result = pGetKey(ControllerSlot(index, primary), reserved, key);
+    if (result == ERROR_SUCCESS && key) key->UserIndex = static_cast<BYTE>(ControllerSlot(key->UserIndex, primary));
+    return result;
+}
+DWORD WINAPI Proxy_101(DWORD index, DWORD flags, void* context) { Init(); return p101 ? p101(ControllerSlot(index), flags, context) : ERROR_DEVICE_NOT_CONNECTED; }
+DWORD WINAPI Proxy_102(DWORD index) { Init(); return p102 ? p102(ControllerSlot(index)) : ERROR_DEVICE_NOT_CONNECTED; }
+DWORD WINAPI Proxy_103(DWORD index) { Init(); return p103 ? p103(ControllerSlot(index)) : ERROR_DEVICE_NOT_CONNECTED; }
 }
 BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
     if (r == DLL_PROCESS_ATTACH) {
