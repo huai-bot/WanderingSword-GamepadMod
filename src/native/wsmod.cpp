@@ -14,6 +14,8 @@
 #include <audiopolicy.h>
 #pragma comment(lib, "advapi32.lib")
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cwchar>
 #include <vector>
@@ -29,6 +31,8 @@ static void Log(const char* fmt, ...) {
     va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a); fputc('\n', f); fclose(f);
 }
 
+#include "runtime_bridge.inc"
+
 // ============================================================ quick-battle audio (only this process)
 // Keep the user's volume and original mute state. COM objects live only on this worker, not the game thread.
 // Lua sends a heartbeat independently of the mask; after 500 ms without it, restore every session we changed.
@@ -38,7 +42,7 @@ extern "C" __declspec(dllexport) int wsmod_mute_1(void*) {
     InterlockedExchange(&g_muteTick, (LONG)GetTickCount());
     InterlockedExchange(&g_muteWanted, 1); return 0;
 }
-struct MutedSession { std::wstring id; ISimpleAudioVolume* volume; BOOL original; };
+struct MutedSession { std::wstring id; ISimpleAudioVolume* volume; BOOL original; bool restoreWarned = false; };
 static void MuteGameSessions(IMMDeviceEnumerator* devices, std::vector<MutedSession>& saved) {
     IMMDeviceCollection* outputs = nullptr;
     if (FAILED(devices->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &outputs))) return;
@@ -85,13 +89,26 @@ static void MuteGameSessions(IMMDeviceEnumerator* devices, std::vector<MutedSess
     }
 }
 static void RestoreGameAudio(std::vector<MutedSession>& saved) {
-    for (auto& s : saved) {
-        HRESULT hr = s.volume->SetMute(s.original, nullptr);
-        if (SUCCEEDED(hr)) Log("quick battle audio restored (mute=%d)", (int)s.original);
-        else Log("quick battle audio restore: session unavailable (0x%08lx)", (unsigned long)hr);
-        s.volume->Release();
+    for (auto it = saved.begin(); it != saved.end();) {
+        HRESULT hr = it->volume->SetMute(it->original, nullptr);
+        bool expired = false;
+        if (FAILED(hr)) {
+            IAudioSessionControl* control = nullptr; AudioSessionState state = AudioSessionStateInactive;
+            if (SUCCEEDED(it->volume->QueryInterface(IID_PPV_ARGS(&control)))) {
+                expired = SUCCEEDED(control->GetState(&state)) && state == AudioSessionStateExpired;
+                control->Release();
+            }
+        }
+        if (SUCCEEDED(hr) || expired) {
+            if (SUCCEEDED(hr)) Log("quick battle audio restored (mute=%d)", (int)it->original);
+            else Log("quick battle audio restore: expired session released");
+            it->volume->Release(); it = saved.erase(it);
+        } else {
+            // A transient COM/device error must not discard the user's original mute state.
+            if (!it->restoreWarned) { Log("quick battle audio restore pending, retrying (0x%08lx)", (unsigned long)hr); it->restoreWarned = true; }
+            ++it;
+        }
     }
-    saved.clear();
 }
 static DWORD WINAPI AudioThread(LPVOID) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -109,7 +126,7 @@ static DWORD WINAPI AudioThread(LPVOID) {
         bool want = requested != 0 && tick - heartbeat < 500;
         if (want) {
             if (!active || tick - lastScan >= 250) { MuteGameSessions(devices, saved); lastScan = tick; }
-        } else if (active) RestoreGameAudio(saved);
+        } else if (!saved.empty()) RestoreGameAudio(saved);
         active = want;
         Sleep(25);
     }
@@ -159,12 +176,8 @@ static volatile LONG g_navMask = 0, g_navStage = 0; static volatile DWORD g_navT
 static volatile LONG g_ev[7];          // L R < > ^ v Y (battle speed)
 static const char EV_CH[7] = { 'L', 'R', '<', '>', '^', 'v', 'Y' };
 // Lua arms the single-Y shortcut only while a real fight is active. A stopped loop restores native input.
-static volatile LONG g_speedInput = 0, g_speedInputTick = 0;
-extern "C" __declspec(dllexport) int wsmod_speed_input_0(void*) { InterlockedExchange(&g_speedInput, 0); return 0; }
-extern "C" __declspec(dllexport) int wsmod_speed_input_1(void*) {
-    InterlockedExchange(&g_speedInputTick, (LONG)GetTickCount());
-    InterlockedExchange(&g_speedInput, 1); return 0;
-}
+extern "C" __declspec(dllexport) int wsmod_speed_input_0(void* lua) { RuntimeInput(lua, false); return 0; }
+extern "C" __declspec(dllexport) int wsmod_speed_input_1(void* lua) { RuntimeInput(lua, true); return 0; }
 static LONG NavMask() { return (GetTickCount() - g_navTime < 300) ? g_navMask : 0; }   // stale -> nothing blocked
 extern "C" __declspec(dllexport) int wsmod_nav_begin(void*) { g_navStage = 0; return 0; }
 extern "C" __declspec(dllexport) int wsmod_nav_up(void*) { g_navStage |= NAV_UP; return 0; }
@@ -193,6 +206,76 @@ static std::wstring ReadSmallFile(const wchar_t* name) {
     std::wstring path = std::wstring(DATA_DIR) + name, out;
     FILE* f = nullptr; if (_wfopen_s(&f, path.c_str(), L"rt, ccs=UTF-8") != 0 || !f) return out;
     wchar_t buf[1024]; while (fgetws(buf, 1024, f)) out += buf; fclose(f); return out;
+}
+
+// Gift receiver is not reflected. Lua supplies a live, class-checked gift-backpack VM on the game thread.
+// Validate the native vtable for v1.24.32 before reading its receiver; never infer it from the team tab.
+extern "C" __declspec(dllexport) int wsmod_gift_context(void*) {
+    unsigned long long address = 0; int receiver = -1; uintptr_t vt = 0; SIZE_T got = 0;
+    auto request = ReadSmallFile(L"gift_vm.txt");
+    if (swscanf_s(request.c_str(), L"%llx", &address) == 1 && address && address <= UINTPTR_MAX - 0x1ac &&
+        ReadProcessMemory(GetCurrentProcess(), (const void*)(uintptr_t)address, &vt, sizeof(vt), &got) && got == sizeof(vt) &&
+        vt == (uintptr_t)GetModuleHandleW(nullptr) + 0x432a750) {
+        if (!ReadProcessMemory(GetCurrentProcess(), (const void*)((uintptr_t)address + 0x1a8), &receiver, sizeof(receiver), &got) || got != sizeof(receiver)) receiver = -1;
+    }
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, DATA_DIR L"gift_context.txt", L"wb") == 0 && f) { fprintf(f, "%llx|%d\n", address, receiver); fclose(f); }
+    return 0;
+}
+
+// Renderer-only RebuidFollowers copy. Skip the follow-visibility/mount display gates in this copy,
+// not in the game: never toggle MountManager, SetFastRun, movement speed, or mount effects.
+#include "walk_rebuild.inc"
+static unsigned char* g_walkClone = nullptr;
+static RUNTIME_FUNCTION g_walkUnwind = {};
+static bool g_walkCloneChecked = false, g_walkCloneFailed = false;
+static bool InitWalkClone() {
+    if (g_walkCloneChecked) return g_walkClone && !g_walkCloneFailed;
+    g_walkCloneChecked = true;
+    uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr), source = base + 0xfbe3f0;
+    unsigned char code[sizeof(WS_WALK_CODE)]; SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (void*)source, code, sizeof(code), &got) || got != sizeof(code) ||
+        memcmp(code, WS_WALK_CODE, sizeof(code)) != 0) { Log("walk followers disabled: native renderer version mismatch"); return false; }
+    size_t unwindAt = (sizeof(code) + 3) & ~(size_t)3, bytes = unwindAt + sizeof(WS_WALK_UNWIND);
+    // All original RIP-relative references remain in range; allocation occurs once, on the game thread.
+    for (uintptr_t delta = 0x10000000; delta < 0x50000000 && !g_walkClone; delta += 0x10000)
+        g_walkClone = (unsigned char*)VirtualAlloc((void*)((base + delta) & ~(uintptr_t)0xffff), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!g_walkClone) { Log("walk followers disabled: no near renderer allocation"); return false; }
+    memcpy(g_walkClone, code, sizeof(code)); memcpy(g_walkClone + unwindAt, WS_WALK_UNWIND, sizeof(WS_WALK_UNWIND));
+    for (const auto& r : WS_WALK_RELOCS) {
+        int32_t displacement = 0; memcpy(&displacement, code + r[0], sizeof(displacement));
+        uintptr_t target = source + r[1] + displacement;
+        if (target >= source && target < source + sizeof(code)) continue;
+        int64_t adjusted = (int64_t)target - ((int64_t)(uintptr_t)g_walkClone + r[1]);
+        if (adjusted < INT32_MIN || adjusted > INT32_MAX) { VirtualFree(g_walkClone, 0, MEM_RELEASE); g_walkClone = nullptr; return false; }
+        displacement = (int32_t)adjusted; memcpy(g_walkClone + r[0], &displacement, sizeof(displacement));
+    }
+    memset(g_walkClone + 0x75, 0x90, 6); // only the copy: show followers even if the native display setting is off
+    memset(g_walkClone + 0xa0, 0x90, 6); // only the copy: allow walking followers while a mount remains equipped
+    DWORD old = 0;
+    if (!VirtualProtect(g_walkClone, bytes, PAGE_EXECUTE_READ, &old)) { VirtualFree(g_walkClone, 0, MEM_RELEASE); g_walkClone = nullptr; return false; }
+    g_walkUnwind.BeginAddress = 0; g_walkUnwind.EndAddress = (DWORD)sizeof(code); g_walkUnwind.UnwindData = (DWORD)unwindAt;
+    if (!RtlAddFunctionTable(&g_walkUnwind, 1, (DWORD64)g_walkClone)) { VirtualFree(g_walkClone, 0, MEM_RELEASE); g_walkClone = nullptr; return false; }
+    FlushInstructionCache(GetCurrentProcess(), g_walkClone, bytes);
+    Log("walk followers: renderer-only copy ready (mount/speed/effects unchanged)"); return true;
+}
+static bool CallWalkClone(uintptr_t actor) {
+    // The copied unwind codes restore the stack; faults leave this feature disabled, not repeatedly retried.
+    __try { ((void (*)(void*))g_walkClone)((void*)actor); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_walkCloneFailed = true; Log("walk followers disabled: renderer fault (0x%08lx)", GetExceptionCode()); return false; }
+}
+extern "C" __declspec(dllexport) int wsmod_walk_rebuild(void*) {
+    unsigned long long address = 0; uintptr_t vt = 0, sprite = 0; SIZE_T got = 0; bool ok = false;
+    auto request = ReadSmallFile(L"walk_actor.txt");
+    uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+    if (swscanf_s(request.c_str(), L"%llx", &address) == 1 && address && address <= UINTPTR_MAX - 0x540 &&
+        ReadProcessMemory(GetCurrentProcess(), (void*)(uintptr_t)address, &vt, sizeof(vt), &got) && got == sizeof(vt) &&
+        vt >= base + 0x3ee0000 && vt < base + 0x56c0000 &&
+        ReadProcessMemory(GetCurrentProcess(), (void*)((uintptr_t)address + 0x4f0), &sprite, sizeof(sprite), &got) && got == sizeof(sprite) && sprite &&
+        InitWalkClone()) ok = CallWalkClone((uintptr_t)address);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, DATA_DIR L"walk_result.txt", L"wb") == 0 && f) { fprintf(f, "%llx|%d\n", address, ok ? 1 : 0); fclose(f); }
+    return 0;
 }
 
 // ============================================================ UI targets (button rects, screen pixels)
@@ -403,15 +486,15 @@ static DWORD WINAPI MouseThread(LPVOID) {
             FILE* tf = nullptr;
             if (_wfopen_s(&tf, DATA_DIR L"trig.req", L"ab") == 0 && tf) { for (int k = 0; k < 7; k++) for (LONG i = 0; i < n[k]; i++) fputc(EV_CH[k], tf); fclose(tf); }
           } }
-        if ((++n % 25) == 0) {
+        if ((++n % 6) == 0) {
             std::wstring s = ReadSmallFile(L"map.flag");
-            LONG nm = (!s.empty() && s[0] == L'1') ? 1 : 0;
+            LONG nm = s == L"1" ? 1 : s == L"0" ? 0 : g_mapOpen;
             if (nm != g_mapOpen) { g_mapOpen = nm; Log("world map %s", nm ? "open" : "closed"); if (!nm && g_menuOpen) MenuCmd(CMD_CLOSE); }
             std::wstring bs = ReadSmallFile(L"battle.flag");
-            LONG nb = (!bs.empty() && bs[0] == L'1') ? 1 : 0;
+            LONG nb = bs == L"1" ? 1 : bs == L"0" ? 0 : g_battle;
             if (nb != g_battle) { g_battle = nb; Log("battle %s: right stick %s", nb ? "start" : "end", nb ? "native" : "mouse"); }
             std::wstring fs = ReadSmallFile(L"fight.flag");
-            LONG nf = (!fs.empty() && fs[0] == L'1') ? 1 : 0;
+            LONG nf = fs == L"1" ? 1 : fs == L"0" ? 0 : g_fight;
             if (nf != g_fight) { g_fight = nf; Log("fight %s: Start %s", nf ? "start" : "end", nf ? "native" : "-> character screen"); }
         }
         bool active = GameFocused() && !g_mapOpen && !g_menuOpen && !g_battle;
@@ -455,8 +538,10 @@ static DWORD WINAPI MouseThread(LPVOID) {
 }
 
 // ============================================================ teleport data
+static const int COLS = 4, ROWS = 7;
 struct Place {
     std::wstring region, name; std::vector<std::wstring> levels;
+    wchar_t initial = L'#';
     std::wstring stLv; double sx = 0, sy = 0, sz = 0; bool hasSt = false;
     // resolved
     bool visited = false, current = false; std::wstring tLv; double tx = 0, ty = 0, tz = 0;
@@ -464,7 +549,24 @@ struct Place {
 static const wchar_t* REGIONS[6] = { L"中原", L"西域", L"关外", L"南疆", L"北地", L"海外" };
 static std::vector<Place> g_all;
 static std::vector<int> g_list[6];     // all places per region (indices into g_all), including locked ones
+struct PlaceRow { wchar_t initial; std::vector<int> items; }; // items are positions in the regional list
+static std::vector<PlaceRow> g_rows[6];
+static std::vector<int> g_itemRow[6], g_itemCol[6];
 static int g_total[6], g_visited[6];
+static wchar_t PlaceInitial(const std::wstring& name) {
+    if (name.empty()) return L'#';
+    wchar_t ch = name[0];
+    if (ch >= L'a' && ch <= L'z') return ch - L'a' + L'A';
+    if (ch >= L'A' && ch <= L'Z') return ch;
+    // zh-CN uses pinyin collation. Boundaries cover rare characters outside the GB2312 range too.
+    static const wchar_t* bounds[] = { L"阿", L"八", L"擦", L"搭", L"蛾", L"发", L"噶", L"哈", L"击", L"喀", L"垃", L"妈", L"拿", L"哦", L"啪", L"期", L"然", L"撒", L"塌", L"挖", L"昔", L"压", L"匝" };
+    static const wchar_t* letters = L"ABCDEFGHJKLMNOPQRSTWXYZ";
+    for (int i = (int)(sizeof(bounds) / sizeof(bounds[0])) - 1; i >= 0; --i) {
+        int order = CompareStringEx(L"zh-CN", SORT_STRINGSORT, &ch, 1, bounds[i], 1, nullptr, nullptr, 0);
+        if (order == CSTR_EQUAL || order == CSTR_GREATER_THAN) return letters[i];
+    }
+    return L'#';
+}
 static std::wstring g_curLv;
 
 static std::vector<std::wstring> Split(const std::wstring& s, wchar_t d) {
@@ -478,7 +580,7 @@ static void LoadPlaces() {
         for (auto& line : Split(all, L'\n')) {
             if (line.empty()) continue;
             auto c = Split(line, L'\t'); if (c.size() < 3) continue;
-            Place p; p.region = c[0]; p.name = c[1]; p.levels = Split(c[2], L',');
+            Place p; p.region = c[0]; p.name = c[1]; p.initial = PlaceInitial(p.name); p.levels = Split(c[2], L',');
             if (c.size() >= 5 && !c[3].empty()) { p.stLv = c[3]; p.hasSt = swscanf_s(c[4].c_str(), L"%lf,%lf,%lf", &p.sx, &p.sy, &p.sz) == 3; }
             g_all.push_back(p);
         }
@@ -496,22 +598,34 @@ static void LoadPlaces() {
     for (int i = 0; i < (int)g_all.size(); i++) {
         Place& p = g_all[i]; p.visited = false; p.current = false;
         for (auto& lv : p.levels) if (lv == g_curLv) p.current = true;
-        const V* first = nullptr; bool stVisited = false;
-        for (auto& lv : p.levels) for (auto& v : vis) if (v.lv == lv) { if (!first) first = &v; if (p.hasSt && lv == p.stLv) stVisited = true; }
-        if (first) {
-            p.visited = true;
-            if (stVisited) { p.tLv = p.stLv; p.tx = p.sx; p.ty = p.sy; p.tz = p.sz; }
-            else { p.tLv = first->lv; p.tx = first->x; p.ty = first->y; p.tz = first->z; }
+        const V* landing = nullptr;
+        for (auto& lv : p.levels) for (auto& v : vis) if (v.lv == lv && (!landing || (p.hasSt && lv == p.stLv))) landing = &v;
+        if (landing) {
+            // Prefer the station's LEVEL, never its unverified XYZ (e.g. underground in Pingkang).
+            p.visited = true; p.tLv = landing->lv; p.tx = landing->x; p.ty = landing->y; p.tz = landing->z;
         }
         for (int r = 0; r < 6; r++) if (p.region == REGIONS[r]) {
             g_list[r].push_back(i); g_total[r]++; if (p.visited) g_visited[r]++;
         }
     }
-    for (auto& list : g_list) std::stable_sort(list.begin(), list.end(), [](int a, int b) {
-        const auto& x = g_all[a].name; const auto& y = g_all[b].name;
-        int order = CompareStringEx(L"zh-CN", SORT_STRINGSORT, x.c_str(), (int)x.size(), y.c_str(), (int)y.size(), nullptr, nullptr, 0);
-        return order ? order == CSTR_LESS_THAN : x < y;
-    });
+    for (int r = 0; r < 6; ++r) {
+        auto& list = g_list[r];
+        std::stable_sort(list.begin(), list.end(), [](int a, int b) {
+            const Place& x = g_all[a]; const Place& y = g_all[b];
+            if (x.initial != y.initial) return x.initial < y.initial;
+            int order = CompareStringEx(L"zh-CN", SORT_STRINGSORT, x.name.c_str(), (int)x.name.size(), y.name.c_str(), (int)y.name.size(), nullptr, nullptr, 0);
+            return order ? order == CSTR_LESS_THAN : x.name < y.name;
+        });
+        g_rows[r].clear(); g_itemRow[r].resize(list.size()); g_itemCol[r].resize(list.size());
+        for (int i = 0; i < (int)list.size(); ++i) {
+            wchar_t initial = g_all[list[i]].initial;
+            if (g_rows[r].empty() || g_rows[r].back().initial != initial || (int)g_rows[r].back().items.size() == COLS)
+                g_rows[r].push_back({ initial, {} });
+            g_itemRow[r][i] = (int)g_rows[r].size() - 1;
+            g_itemCol[r][i] = (int)g_rows[r].back().items.size();
+            g_rows[r].back().items.push_back(i);
+        }
+    }
 }
 static int RegionOfCurrent() {
     for (auto& p : g_all) if (p.current) for (int r = 0; r < 6; r++) if (p.region == REGIONS[r]) return r;
@@ -519,15 +633,14 @@ static int RegionOfCurrent() {
 }
 
 // ============================================================ teleport panel
-static const int COLS = 4, ROWS = 7;
-static const int PW = 1000, CELLW = 228, CELLH = 54, GAP = 10, GX = 28, GY = 132, TABY = 70, TABH = 44, TABW = 148;
+static const int PW = 1000, CELLW = 216, CELLH = 54, GAP = 10, GX = 28, LETTERW = 48, GY = 132, TABY = 70, TABH = 44, TABW = 148;
 static const int PH = GY + ROWS * (CELLH + GAP) + 64;
 static int g_tab = 0, g_sel = 0, g_top = 0, g_hoverTab = -1;
 static std::wstring g_toast; static DWORD g_toastUntil;
 static HFONT fTitle, fTab, fCell, fHint;
 
 static RECT TabRect(int i) { RECT r{ GX + i * (TABW + 8), TABY, GX + i * (TABW + 8) + TABW, TABY + TABH }; return r; }
-static RECT CellRect(int vis) { int c = vis % COLS, r = vis / COLS; RECT rc{ GX + c * (CELLW + GAP), GY + r * (CELLH + GAP), GX + c * (CELLW + GAP) + CELLW, GY + r * (CELLH + GAP) + CELLH }; return rc; }
+static RECT CellRect(int vis) { int c = vis % COLS, r = vis / COLS; RECT rc{ GX + LETTERW + c * (CELLW + GAP), GY + r * (CELLH + GAP), GX + LETTERW + c * (CELLW + GAP) + CELLW, GY + r * (CELLH + GAP) + CELLH }; return rc; }
 static void Fill(HDC dc, RECT r, COLORREF c) { HBRUSH b = CreateSolidBrush(c); FillRect(dc, &r, b); DeleteObject(b); }
 static void Frame(HDC dc, RECT r, COLORREF c, int w) { HPEN p = CreatePen(PS_SOLID, w, c); HGDIOBJ op = SelectObject(dc, p), ob = SelectObject(dc, GetStockObject(NULL_BRUSH)); Rectangle(dc, r.left, r.top, r.right, r.bottom); SelectObject(dc, op); SelectObject(dc, ob); DeleteObject(p); }
 static void Text(HDC dc, const std::wstring& s, RECT r, COLORREF c, HFONT f, UINT fl) { SelectObject(dc, f); SetTextColor(dc, c); DrawTextW(dc, s.c_str(), -1, &r, fl | DT_SINGLELINE | DT_NOPREFIX); }
@@ -536,8 +649,9 @@ static void ClampSel() {
     int n = (int)g_list[g_tab].size();
     if (n == 0) { g_sel = 0; g_top = 0; return; }
     if (g_sel < 0) g_sel = 0; if (g_sel >= n) g_sel = n - 1;
-    int row = g_sel / COLS;
+    int row = g_itemRow[g_tab][g_sel];
     if (row < g_top) g_top = row; if (row >= g_top + ROWS) g_top = row - ROWS + 1;
+    g_top = std::max(0, std::min(g_top, (int)g_rows[g_tab].size() - ROWS));
 }
 static void DrawPanel(HDC dc) {
     const COLORREF BG = RGB(24, 21, 18), GOLD = RGB(206, 170, 98), INK = RGB(236, 226, 204), DIM = RGB(130, 120, 104);
@@ -557,10 +671,15 @@ static void DrawPanel(HDC dc) {
     Text(dc, L"LB", { GX - 26, TABY, GX - 2, TABY + TABH }, DIM, fHint, DT_CENTER | DT_VCENTER);
     Text(dc, L"RB", { TabRect(5).right + 2, TABY, TabRect(5).right + 30, TABY + TABH }, DIM, fHint, DT_CENTER | DT_VCENTER);
     auto& L = g_list[g_tab]; int n = (int)L.size();
-    if (n == 0) Text(dc, L"此区域尚未到访任何地点", { GX, GY, PW - GX, GY + 3 * CELLH }, DIM, fCell, DT_CENTER | DT_VCENTER);
-    for (int v = 0; v < ROWS * COLS; v++) {
-        int i = g_top * COLS + v; if (i >= n) break;
-        Place& p = g_all[L[i]]; RECT r = CellRect(v); bool sel = i == g_sel;
+    if (n == 0) Text(dc, L"此区域暂无地点", { GX, GY, PW - GX, GY + 3 * CELLH }, DIM, fCell, DT_CENTER | DT_VCENTER);
+    auto& rows = g_rows[g_tab];
+    for (int vr = 0; vr < ROWS && g_top + vr < (int)rows.size(); ++vr) {
+        int ri = g_top + vr; auto& row = rows[ri];
+        if (vr == 0 || rows[ri - 1].initial != row.initial)
+            Text(dc, std::wstring(1, row.initial), { GX, GY + vr * (CELLH + GAP), GX + LETTERW - GAP, GY + vr * (CELLH + GAP) + CELLH }, GOLD, fTab, DT_CENTER | DT_VCENTER);
+        for (int c = 0; c < (int)row.items.size(); ++c) {
+        int i = row.items[c];
+        Place& p = g_all[L[i]]; RECT r = CellRect(vr * COLS + c); bool sel = i == g_sel;
         bool locked = !p.visited, selected = sel && !locked;
         Fill(dc, r, selected ? GOLD : (locked ? RGB(29, 27, 25) : RGB(40, 35, 29)));
         Frame(dc, r, sel ? (locked ? DIM : RGB(250, 220, 150)) : RGB(84, 70, 46), sel ? 2 : 1);
@@ -572,8 +691,9 @@ static void DrawPanel(HDC dc) {
         if (locked) Text(dc, L"未解锁", tr, DIM, fHint, DT_RIGHT | DT_VCENTER);
         else if (p.current) Text(dc, L"当前", tr, selected ? RGB(60, 44, 20) : GOLD, fHint, DT_RIGHT | DT_VCENTER);
         else if (p.hasSt && p.tLv == p.stLv) Text(dc, L"驿站", tr, selected ? RGB(60, 44, 20) : DIM, fHint, DT_RIGHT | DT_VCENTER);
+        }
     }
-    int rowsTotal = (n + COLS - 1) / COLS;
+    int rowsTotal = (int)rows.size();
     if (rowsTotal > ROWS) {
         int trackT = GY, trackB = GY + ROWS * (CELLH + GAP) - GAP, x = PW - 16;
         Fill(dc, { x, trackT, x + 4, trackB }, RGB(60, 52, 40));
@@ -594,24 +714,36 @@ static void DoTeleport() {
     Place& p = g_all[L[g_sel]];
     if (!p.visited) { Toast(L"此地点尚未解锁，到访后才能传送"); InvalidateRect(g_menuWnd, nullptr, FALSE); return; }
     if (p.current) { Toast(L"你已经在这里了"); InvalidateRect(g_menuWnd, nullptr, FALSE); return; }
+    char lv[128] = {};
     FILE* f = nullptr;
-    if (_wfopen_s(&f, DATA_DIR L"teleport.req", L"wb") == 0 && f) {
-        char lv[128]; WideCharToMultiByte(CP_UTF8, 0, p.tLv.c_str(), -1, lv, 128, nullptr, nullptr);
-        fprintf(f, "%s|%.0f|%.0f|%.0f\n", lv, p.tx, p.ty, p.tz); fclose(f);
-        Log("teleport request %s %.0f %.0f %.0f", lv, p.tx, p.ty, p.tz);
+    bool sent = false;
+    if (WideCharToMultiByte(CP_UTF8, 0, p.tLv.c_str(), -1, lv, sizeof(lv), nullptr, nullptr) &&
+        _wfopen_s(&f, DATA_DIR L"teleport.tmp", L"wb") == 0 && f) {
+        bool wrote = fprintf(f, "%s|%.0f|%.0f|%.0f\n", lv, p.tx, p.ty, p.tz) > 0;
+        bool closed = fclose(f) == 0;
+        sent = wrote && closed && MoveFileExW(DATA_DIR L"teleport.tmp", DATA_DIR L"teleport.req", 0);
     }
+    if (!sent) { Toast(L"传送请求未送出，请稍后再试"); InvalidateRect(g_menuWnd, nullptr, FALSE); return; }
+    Log("teleport request %s %.0f %.0f %.0f", lv, p.tx, p.ty, p.tz);
     g_menuOpen = 0; ShowWindow(g_menuWnd, SW_HIDE);
 }
 static void Move(int dx, int dy) {
     int n = (int)g_list[g_tab].size(); if (!n) return;
-    int s = g_sel + dx + dy * COLS;
-    if (dy && (s < 0 || s >= n)) s = dy < 0 ? g_sel % COLS : std::min(n - 1, (n - 1) / COLS * COLS + g_sel % COLS);
-    if (dx && (s < 0 || s >= n)) s = dx < 0 ? n - 1 : 0;
-    g_sel = s; ClampSel();
+    if (dy) {
+        auto& rows = g_rows[g_tab]; int row = g_itemRow[g_tab][g_sel], col = g_itemCol[g_tab][g_sel];
+        int target = std::max(0, std::min(row + dy, (int)rows.size() - 1));
+        auto& items = rows[target].items;
+        g_sel = items[std::min(col, (int)items.size() - 1)];
+    } else if (dx) g_sel = (g_sel + dx + n) % n;
+    ClampSel();
 }
 static void SetTab(int t) { g_tab = (t + 6) % 6; g_sel = 0; g_top = 0; ClampSel(); }
 static int HitCell(POINT pt) {
-    for (int v = 0; v < ROWS * COLS; v++) { RECT r = CellRect(v); if (PtInRect(&r, pt)) { int i = g_top * COLS + v; return i < (int)g_list[g_tab].size() ? i : -1; } }
+    auto& rows = g_rows[g_tab];
+    for (int vr = 0; vr < ROWS && g_top + vr < (int)rows.size(); ++vr) {
+        auto& items = rows[g_top + vr].items;
+        for (int c = 0; c < (int)items.size(); ++c) { RECT r = CellRect(vr * COLS + c); if (PtInRect(&r, pt)) return items[c]; }
+    }
     return -1;
 }
 static int HitTab(POINT pt) { for (int i = 0; i < 6; i++) { RECT r = TabRect(i); if (PtInRect(&r, pt)) return i; } return -1; }
@@ -935,10 +1067,12 @@ static DWORD WINAPI MenuThread(LPVOID) {
 }
 
 // ============================================================ gamepad filtering
+#include "map_press.inc"
+static MapPress g_mapPress;
 static WORD g_prevBtn; static int g_repDir; static DWORD g_repT;
 static void PadMenu(const XINPUT_GAMEPAD& g) {
     WORD b = g.wButtons, pressed = b & ~g_prevBtn; g_prevBtn = b;
-    if (!g_menuOpen) { if (g_mapOpen && (pressed & XINPUT_GAMEPAD_Y)) MenuCmd(CMD_OPEN); return; }
+    if (!g_menuOpen) return; // opening is decided once from the raw pad, before filters
     if (pressed & (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_Y)) { MenuCmd(CMD_CLOSE); return; }
     if (pressed & XINPUT_GAMEPAD_A) { MenuCmd(CMD_OK); return; }
     if (pressed & XINPUT_GAMEPAD_LEFT_SHOULDER) MenuCmd(CMD_TABL);
@@ -1056,23 +1190,8 @@ static void PadPrime(XINPUT_GAMEPAD& g) {
         }
     }
 }
-// 0 = released, 1 = bridged single Y, 2 = native combination; keep that choice until Y is released.
-static int g_speedKey = 0;
-static void PadBattleSpeed(XINPUT_GAMEPAD& g, bool active) {
-    bool down = (g.wButtons & XINPUT_GAMEPAD_Y) != 0;
-    if (!down) { g_speedKey = 0; return; }
-    LONG enabled = InterlockedCompareExchange(&g_speedInput, 0, 0);
-    DWORD heartbeat = (DWORD)InterlockedCompareExchange(&g_speedInputTick, 0, 0);
-    bool ready = active && enabled && GetTickCount() - heartbeat < 500;
-    if (g_speedKey == 1 && !ready) g_speedKey = 2;  // even a held Y is released when Lua stops updating
-    if (g_speedKey == 0) {
-        bool single = !(g.wButtons & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER)) &&
-            g.bLeftTrigger <= 40 && g.bRightTrigger <= 40;
-        g_speedKey = ready && single ? 1 : 2;
-        if (g_speedKey == 1) { InterlockedIncrement(&g_ev[6]); Log("battle Y -> speed cycle"); }
-    }
-    if (g_speedKey == 1) g.wButtons &= ~XINPUT_GAMEPAD_Y;
-}
+// One physical press across all proxy copies; serial snapshots do not share the navigation file.
+static void PadBattleSpeed(XINPUT_GAMEPAD& g, bool active) { RuntimeBattleY(g, active); }
 static void ReleaseClick() { if (g_aClick) { MouseBtn(false); g_aClick = false; } }
 static DWORD Handle(PFN_GetState fn, DWORD idx, XINPUT_STATE* s) {
     if (!fn) return ERROR_DEVICE_NOT_CONNECTED;
@@ -1082,11 +1201,13 @@ static DWORD Handle(PFN_GetState fn, DWORD idx, XINPUT_STATE* s) {
     if ((LONG)idx != g_primary) return r;
     XINPUT_GAMEPAD& g = s->Gamepad;
     bool focus = GameFocused();
-    PadBattleSpeed(g, focus && !g_mapOpen && !g_menuOpen);  // Lua's heartbeat limits this to a real fight
+    bool openMapPanel = g_mapPress.sample(g, focus && !g_fight, g_mapOpen != 0, g_menuOpen != 0, GetTickCount());
+    PadBattleSpeed(g, focus && !g_menuOpen && !g_mapOpen); // confirmed map owns Y
     if (focus && !g_menuOpen) PadPrime(g);
     // the world map cannot be open during a real fight, but battle.flag is also 1 on the overworld (LV_World):
     // map state wins, so Y / the teleport panel work when the map is opened from the overworld
     if (focus && (!g_battle || g_mapOpen || g_menuOpen)) { if (!g_menuOpen) PadSpeedCombo(g); PadMenu(g); }
+    if (openMapPanel) MenuCmd(CMD_OPEN);
     if (g_menuOpen) { ReleaseClick(); ZeroMemory(&g, sizeof(g)); return r; }                    // panel owns the pad
     if (g_mapOpen) { ReleaseClick(); g.wButtons &= ~XINPUT_GAMEPAD_Y; return r; }               // map: native except Y
     if (g_battle) {                                                                              // battle: all native...
@@ -1117,7 +1238,7 @@ static BOOL CALLBACK InitReal(PINIT_ONCE, PVOID, PVOID*) {
     p102 = (PFN_1DW)GetProcAddress(g_real, (LPCSTR)102);
     p103 = (PFN_1DW)GetProcAddress(g_real, (LPCSTR)103);
     LoadConfig();
-    Log("wsmod loaded (speed %.0f, deadzone %.0f)", CFG_SPEED, CFG_DEADZONE);
+    Log("wsmod loaded v4.30 (pid=%lu dll=%p speed %.0f, deadzone %.0f)", GetCurrentProcessId(), g_self, CFG_SPEED, CFG_DEADZONE);
     CreateThread(nullptr, 0, CursorThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, MenuThread, nullptr, 0, nullptr);
     CreateThread(nullptr, 0, MouseThread, nullptr, 0, nullptr);

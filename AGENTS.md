@@ -6,6 +6,8 @@
 
 模组分两层，通过 `D:\TOOLS\AWSdata\WanderingSword\`（下称 DATA）里的小文件通信。
 
+本机项目统一位于 `D:\GAME\DST\项目资料\临时项目\WanderingSword\`：仓库在 `WanderingSword-GamepadMod\`，DATA 实体在 `运行数据\`，旧 DATA 地址仅为兼容目录联接（勿删除）；历史备份、截图、工具、解包和离线资料均保留在项目内。后续不要另建散落目录；安装备份默认在仓库同级 `backups\`，已有备份不重复创建。
+
 ```
 手柄 ──XInput──> xinput1_3.dll（本项目，src/native）──过滤后的状态──> 游戏
                   │  右摇杆→SendInput 鼠标；叠加层窗口（指针/传送面板/调速提示）
@@ -50,7 +52,7 @@ powershell -File tools\install.ps1
 ```
 
 - DLL 改完必须重启游戏；Lua 改完可在游戏里按 `Ctrl+R` 热重载（UE4SS 设置里已开 `EnableHotReloadSystem`），但修改调度循环后建议重启。
-- 必须正常退出游戏后安装；install.ps1 会拒绝向运行中的游戏安装。备份统一放在 `D:\TOOLS\dshdata\dshbackup\WanderingSword-install_<时间>\`，保留 game/data 目录结构；`-Backup` 可复用任务已有备份，不覆盖原始备份。用户明确要求不额外备份时可用 `-NoBackup`。
+- 必须正常退出游戏后安装；install.ps1 会拒绝向运行中的游戏安装。备份统一放在仓库同级 `backups\WanderingSword-install_<时间>\`，保留 game/data 目录结构；`-Backup` 可复用任务已有备份，不覆盖原始备份。用户明确要求不额外备份时可用 `-NoBackup`。
 - 安装时把 UE4SS `[Debug]` 的 `ConsoleEnabled` / `GuiConsoleEnabled` / `GuiConsoleVisible` 设为 0，只隐藏窗口，文件日志仍保留。
 - 编译后确认新 DLL 里真的包含你的改动（例如搜索新加的日志字符串），曾经出现过两次编辑互相覆盖、编出来的是旧代码。
 

@@ -55,7 +55,7 @@
   - `GRID_ITEM`（`BP_ItemGridWDT_C`，TileView）：`GetListItems()`、`RemoveItem(spec)`
 - `EBackpackSortType`：1 Value(珍贵) 2 Time 3 Price 4 ItemType(类型)。游戏启动时重置为 1。
 - 物品格子：`BPEntry_Item_WDT_C`，`BindedDataObject` → `ItemInfoSpec`；`ItemDisplay.CMP` 里有 `IMG_Focus`（选中框，平时 Hidden）、`IMG_Border`、`IMG_QualityBorder`、`IMG_SolidBG`、`IMG_NewMark`。
-- 游戏自己的「当前角色不可用/不可学」判定：格子显示数据（`ItemDisplay:GetData():DataToString()`）里的 `"not_learnable":true`，渲染为 `CMP.IMG_Not_Learnable` 可见（置灰）。武器按角色的武器类型、秘籍按能否学习计算，模组直接沿用。`GetBindedDataObj()` 取格子当前绑定的 `ItemInfoSpec`。
+- 游戏自己的「当前角色不可用/不可学」判定：格子显示数据（`ItemDisplay:GetData():DataToString()`）里的 `"not_learnable":true`，渲染为 `CMP.IMG_Not_Learnable` 可见（置灰）。游戏会按当前武器类型、秘籍能否学习等计算置灰；v4.23 仅让非装备学习此判定，装备改按明确的角色要求过滤，避免误隐藏可装备武器。`GetBindedDataObj()` 取格子当前绑定的 `ItemInfoSpec`。
 - 分类标签：`BP_BackpackFilterBtn_C`（`Btn_All/Wu/Fang/Hao/Shu/Cai/Zhenpin/Ren`）。**按钮的 `bIsActive` 不会随切换更新（始终是 `Btn_All`），`Btn_Zhenpin` 的 `FilterIndex` 也是 0，都不能用来判断当前分类。** 当前分类用 `JHMainCharacterBackpackInTeamVM:GetFilterIndex()`（或 `RootData` 里的 `active_filter_type`），取值同 `EBackpackFilterType_Console`：0 全部 1 武器 2 防具 3 丹药 4 秘籍 5 材料 6 珍宝 7 任务（2026-11-23 实测切换验证）。
 - 秘籍「学成」：物品表 `Actions` 中 `ASkill(10)` 的 ID，`TeamInfo:HasSkillById(id)` 为真即已学。图纸学成：格子显示数据 `is_recipe` + `is_acquired`（贴图 `hecheng31_tuzhixuecheng`）。任务道具：`EItemSubType` 60。
 - `JHNeoUIItemUtil:BackpackItemCanDoubleClick_WDT(spec, npc)` 不是可用性判定（置灰的拳套也返回 true），不要用。
@@ -105,6 +105,33 @@
 - `EActionType` 4 = `CAttr`（加属性，`ID` 为属性编号，`Num` 为数值）；5 = `ABuff`。属性编号含义尚未整理。
 - `NPCManager:GetNPCInfo(npcId, false)` → `TeamInfo`：`EquipmentSpecs[]`（已穿装备）、`ItemSpecs`、`AttributeSet`、`GetWeaponType()`。主角 npcId = 0。
 - 当前在人物界面选中的角色：`TeamModuleVM.RootData` JSON 的 `focus_npc_index` + `data[i].npc_id`。
+
+## v4.23 离线定位（运行效果待用户实机验证）
+
+- `GetWeaponType()` 是当前武器类型，不是角色可装备武器集合；装备资格沿用 `Items.Requirements`，不得用它误删其他类型武器，也不得复用旧置灰缓存。
+- `JHPaperFlipbookComponent.DefaultRunAnimalState` / `AnimalState` 的快跑值为 9，普通移动为 2。只映射这两个动画值，保留其他动画、可见性、速度和坐骑效果。主角 `FollowCharacters` 为跟随角色数组。
+- `KeepFastRunState()` 会重新应用控制器当前快跑状态及随从动画；关闭外观覆盖时调用一次，不用旧状态猜测，也不调用 `SetFastRun(false)` 或下坐骑。
+- `JHMainCharacterGiftBackpackVM` 的实际收礼对象不反射：v1.24.32 原生 vtable RVA `0x432a750`，receiver 偏移 `0x1a8`。`wsmod_gift_context` 由 Lua 在游戏线程提供有效 VM 地址，经原生 vtable 校验后只读 4 字节，通过 `gift_vm.txt` / `gift_context.txt` 返回；未知版本/无对象则返回 -1，禁用关系品质过滤，不猜队伍当前人物。
+- `Items.bCantGift` 禁止送礼；原生品质判定 RVA `0x1122f20`：好感度关系等级绝对值 + 1 为最低品质。正向边界 20/40/60/80，负向边界 -20/-40/-60/-80（负向含边界）。关系变化后调用送礼背包的 `HandleBackpackBatchChange()` 让游戏重算 `is_fav`；列表 `RemoveItem` 只隐藏，不删除物品。
+- 音频恢复失败时保留原状态并重试；COM 仍只在音频 worker 使用。
+
+## v4.24 实机反馈后的离线修正
+
+- 完整武器权限来自 `NPCs.NPCs` 的 `WeaponLimits`（`EWeaponType`），原生物品 JSON 在 NPC 定义行 `+0x168` 的数组中逐项匹配；`GetWeaponType()` 只描述当前武器。与 `Items.Requirements` 合并过滤，未知角色保守显示。
+- 观察背包不是人物背包 VM：从可见 `BPMV_Observe_C:GetNeoUIVM():GetSubModuleByKey(FName("Backpack"))` 获取；观察目标优先从自身 `RootData.npc_id` 读取，未知时只用该观察格子当次、物品编号匹配的原生置灰结果过滤武器，不写入装备资格缓存，不拿队伍头像选择代替。共享格子初始化钩子仍只改透明度。
+- 实际送礼点击拒绝锁定 `ItemInfoSpec.bIsLocked`；`bOnlyForLayout` 占位不是可送实体。`BP_Gift_Base` 还检查实际 NPC 的 `GetNPCHobbies()` / 物品子类，再走品质/好感度流程。v4.24 合并这些过滤，并在关系/喜好变化后让原生 VM 重建。
+- 原生 `RebuidFollowers` RVA `0xfbe3f0` 长 `3068` 字节：骑乘门槛直接退出，所以仅改已有随从动画无效。`wsmod_walk_rebuild` 在游戏线程运行版本校验的独立副本，重定位 `95` 处引用，只去掉副本偏移 `0x75` / `0xa0` 的两个显示门槛；不修改原游戏代码/骑乘标志，保留场景与剧情保护。复制 unwind 栈恢复信息，异常时禁用副本；游戏更新后代码不匹配则安全停用，不猜新地址。
+- 步行覆盖收集每个实际 `JHPaperFlipbookComponent`，仅将骑乘状态 9 映射到普通移动，不接管 `bAutoCalcRunOrIdleState`、不按速度硬写 Idle/Run（跟随位移未必产生 Actor 速度），让原版驱动动画；不改速度、buff。关闭时恢复原显示属性、`FollowerCount`，原生重建随从并 `KeepFastRunState()`。
+- 本版仅检查源码、离线模拟和编译，不代表已完成实机回归；需要退出游戏后同时更新 DLL / Lua。
+
+## v4.25 速战输入与恢复
+
+- 被动日志出现两次 v4.24 加载及重复 Y 记录，但不能仅凭日志判定同进程别名或多进程；v4.25 日志补 PID/DLL 地址。同进程命名映射共享 Lua owner、Y 按压锁、累积序号，最新加载实例控制循环；旧实例停止任务及钩子副作用。命名映射只属于当前进程，不读取其他游戏进程。
+- `runtime_bridge.inc` 提供 `wsmod_runtime_claim` / `wsmod_runtime_poll`；Lua C 导出的返回值是 Lua 栈结果数量，不能直接返回状态数值。因此仍用每次加载独立的 `runtime_<token>.txt` 回执，字段 `owner|Y序号|GetTickCount64毫秒`，先删除旧回执，失败则不相信旧值。按序号差接收按键，重复轮询不重复计数；Y 不走共享 `trig.req`。500 ms 心跳停止后释放原生 Y，保留 LB/RB/扳机组合。
+- 实际战斗角色全名作为生命周期标识，过滤 Default__ 控制器；连续战斗即使未采到场间状态也重置 over。新战按键保留，旧结算页需先消失才允许判定新战结算。
+- 速战使用独立单调时钟；超时检查在 HUD/图标就绪返回之前执行，任务异常走同一恢复入口。先释放遮罩、音频、按键拦截，再恢复 1 倍和倍率上限，并只关闭模组开启的自动战斗。此保护依赖游戏线程继续执行，不能解救已经完全死锁的进程。
+- 自动战斗必须确认开启后才加速或遮罩；速战倍率限制 3~20，超时限制 5~30 秒。已有用户配置不重写，超出范围时按安全上限运行。
+- 步行日志的 `attempt to call a TrivialObject value (method 'GetComponentsByClass')` 不是速战任务报错；离线二进制确认实际反射名 `K2_GetComponentsByClass`，改用该方法收集所有精灵。
 
 ## 崩溃记录（避免重蹈）
 

@@ -13,9 +13,13 @@ if (-not (Test-Path (Join-Path $win64 'ue4ss\UE4SS.dll'))) { throw "UE4SS not fo
 $dll = Join-Path $root 'build\xinput1_3.dll'
 if (-not (Test-Path $dll)) { throw "build\xinput1_3.dll missing - run tools\build.bat first" }
 
+# Fail before copying the DLL if a release was unpacked incompletely.
+foreach ($required in @('src\lua\main.lua','data\places.txt','data\wsmod.ini')) {
+  if (-not (Test-Path -LiteralPath (Join-Path $root $required) -PathType Leaf)) { throw "Missing release file: $required" }
+}
 if (Get-Process -Name JH,JH-Win64-Shipping -ErrorAction SilentlyContinue) { throw 'Exit the game normally before installing.' }
 $stamp = Get-Date -Format yyyyMMdd_HHmmss
-if (-not $Backup) { $Backup = "D:\TOOLS\dshdata\dshbackup\WanderingSword-install_$stamp" }
+if (-not $Backup) { $Backup = Join-Path (Split-Path $root -Parent) "backups\WanderingSword-install_$stamp" }
 $bak = [IO.Path]::GetFullPath($Backup)
 function BackupFile([string]$source, [string]$relative) {
   if ($NoBackup) { return }

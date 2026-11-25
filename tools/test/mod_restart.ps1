@@ -1,7 +1,7 @@
 # Restart the GamepadTweaks Lua mod from inside the game (no Ctrl+R, no focus needed):
 # compile-check main.lua in the game, install it, then RestartCurrentMod() via the cmd.lua channel.
 param([string]$expect = "loaded")
-$Repo = 'D:\TOOLS\WanderingSword-GamepadMod'
+$Repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $W = 'D:\TOOLS\AWSdata\WanderingSword'
 $g = 'D:\GAME\Wandering Sword\Wandering_Sword\Binaries\Win64'
 $u = New-Object Text.UTF8Encoding $false

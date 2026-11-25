@@ -1,13 +1,54 @@
-print("[GamepadTweaks] v4.22 loaded\n")
+print("[GamepadTweaks] v4.30 loaded\n")
 -- Everything runs from ONE game-thread loop (LoopInGameThreadWithDelay). Earlier versions queued a new
 -- ExecuteInGameThread callback from several LoopAsync timers; UE4SS 4.0 occasionally frees such a queued
 -- callback early ("Ref was not function") and the game crashes. A single registered loop avoids that.
 
 local DIR = [[D:\TOOLS\AWSdata\WanderingSword\]]
 local DLLPATH = [[D:\GAME\Wandering Sword\Wandering_Sword\Binaries\Win64\xinput1_3.dll]]
+local RUNTIME = { owner = false, events = 0 }
 local function now() return os.clock() end
-local function writeFile(n, s) local f = io.open(DIR .. n, "w"); if f then f:write(s); f:close() end end
+local function writeFile(n, s) local f = io.open(DIR .. n, "w"); if not f then return false end; local ok = f:write(s); return f:close() and ok ~= nil end
 local function readFirst(n) local f = io.open(DIR .. n, "r"); if not f then return nil end local s = f:read("*a"); f:close(); return s end
+
+-- Latest load owns all tasks; older Lua instances cannot compete for files or speed state.
+-- UE4SS may run initialization, the timer and hooks on distinct Lua threads. The
+-- native owner key is lua_State*, so call owner-sensitive exports on one pinned coroutine.
+RUNTIME.call = coroutine.wrap(function(fn)
+  while true do fn(); fn = coroutine.yield() end
+end)
+RUNTIME.claim = package.loadlib(DLLPATH, "wsmod_runtime_claim")
+RUNTIME.pollNative = package.loadlib(DLLPATH, "wsmod_runtime_poll")
+RUNTIME.token = string.format("%x", os.time()) .. "_" .. (tostring(RUNTIME):match("(%x+)$") or "0"):lower()
+RUNTIME.file = "runtime_" .. RUNTIME.token .. ".txt"
+local function runtimePoll()
+  if not RUNTIME.pollNative then RUNTIME.owner = false; return false end
+  local removed, _, errno = os.remove(DIR .. RUNTIME.file)
+  if not removed and errno ~= 2 then RUNTIME.owner, RUNTIME.events = false, 0; return false end
+  RUNTIME.call(RUNTIME.pollNative)
+  local s = readFirst(RUNTIME.file) or ""
+  local owner, serial, clock = s:match("^(%d)|(%d+)|(%d+)$")
+  if owner ~= "1" then RUNTIME.owner, RUNTIME.events = false, 0; return false end
+  serial = tonumber(serial)
+  if RUNTIME.serial then RUNTIME.events = RUNTIME.events + math.min(16, (serial - RUNTIME.serial) % 4294967296) end
+  RUNTIME.owner, RUNTIME.serial, RUNTIME.clock = true, serial, tonumber(clock) / 1000
+  return true
+end
+if RUNTIME.claim and writeFile("runtime_claim.req", RUNTIME.token) then
+  RUNTIME.call(RUNTIME.claim); os.remove(DIR .. "runtime_claim.req")
+end
+if not runtimePoll() then
+  print("[GamepadTweaks] runtime unavailable; install matching v4.30 DLL and Lua together\n")
+  return
+end
+local nativeRegisterHook = RegisterHook
+local function RegisterHook(path, before, after)
+  local function owned(fn)
+    if not fn then return nil end
+    return function(...) if RUNTIME.owner then return fn(...) end end
+  end
+  if after then return nativeRegisterHook(path, owned(before), owned(after)) end
+  return nativeRegisterHook(path, owned(before))
+end
 
 local function live(o)
   if not o or not o:IsValid() then return false end
@@ -26,9 +67,14 @@ local lastLevel = nil
 local function stableWorld()
   if now() < pauseUntil then return nil end
   local pc = FindFirstOf("BP_PlayerController_C")
-  if not pc or not pc:IsValid() then return nil end
+  if not live(pc) or not live(pc.Pawn) then
+    pc = nil
+    for _, candidate in ipairs(FindAllOf("BP_PlayerController_C") or {}) do
+      if live(candidate) and live(candidate.Pawn) then pc = candidate; break end
+    end
+    if not pc then return nil end
+  end
   local pawn = pc.Pawn
-  if not pawn or not pawn:IsValid() then return nil end
   local full = pawn:GetFullName()
   local lv = full:match("%.([%w_]+):PersistentLevel")
   if not lv then return nil end
@@ -36,10 +82,26 @@ local function stableWorld()
   return pc, pawn, lv, full
 end
 
+-- One snapshot for all UI cells and subsystems. Keep the last usable snapshot
+-- across a transient sharing failure; CP936 comments need no decoding.
+local config = { nextAt = 0, values = {} }
+function config.get(key)
+  local t = RUNTIME.clock or now()
+  if t >= config.nextAt then
+    config.nextAt = t + 0.5
+    local raw = readFirst("wsmod.ini")
+    if raw and raw ~= "" then
+      local values = {}
+      for k,v in ("\n" .. raw:gsub("%z", "")):gmatch("\n[ \t]*([%w_]+)[ \t]*=[ \t]*([^;\r\n \t]+)") do
+        if values[k] == nil then values[k] = v end -- same first-match rule as before
+      end
+      if next(values) then config.values = values end
+    end
+  end
+  return config.values[key]
+end
 local function iniNumber(key, def)
-  local s = readFirst("wsmod.ini"); if not s then return def end
-  s = s:gsub("%z", "")
-  return tonumber(s:match("\n%s*" .. key .. "%s*=%s*(%d+)")) or def
+  local v = config.get(key); return tonumber(v and v:match("^(%d+)")) or def
 end
 
 -- ---------------------------------------------------------------- 1) hide the game's own cursor
@@ -171,17 +233,25 @@ local lastBattle = nil
 local fightFlag = nil
 local function writeBattleFlag()
   local f = inFight or (lastBattle == true and lastMap ~= "1")
-  if f ~= battleFlag then battleFlag = f; writeFile("battle.flag", f and "1" or "0") end
-  if inFight ~= fightFlag then fightFlag = inFight; writeFile("fight.flag", inFight and "1" or "0") end   -- proxy: Start native only here
+  if f ~= battleFlag and writeFile("battle.flag", f and "1" or "0") then battleFlag = f end
+  if inFight ~= fightFlag and writeFile("fight.flag", inFight and "1" or "0") then fightFlag = inFight end   -- proxy: Start native only here
 end
+local shownChain
 local function taskMapFlag()
   local open = false
-  if now() >= pauseUntil then
-    local w = FindFirstOf("BPMV_JHNeoUIWorldMap3_C")
-    if w and w:IsValid() and w:IsVisible() then open = true end
+  -- UI visibility is not world readiness. It is safe to inspect widgets during
+  -- the post-travel cooldown; taskTeleport still requires a stable field pawn.
+  if not inFight then
+    local memo = {}
+    for _, w in ipairs(FindAllOf("JHNeoUIWorldMapViewBase") or {}) do
+      if live(w) then
+        local ok, shown = pcall(shownChain, w, memo, 0)
+        if ok and shown then open = true; break end
+      end
+    end
   end
   local v = open and "1" or "0"
-  if v ~= lastMap then lastMap = v; writeFile("map.flag", v); writeBattleFlag() end
+  if v ~= lastMap and writeFile("map.flag", v) then lastMap = v; writeBattleFlag() end
 end
 
 -- ---------------------------------------------------------------- 3) visited levels -> safe landing points
@@ -207,6 +277,7 @@ local function saveVisited()
   writeFile("visited.txt", table.concat(t, "\n") .. "\n")
 end
 saveVisited()
+local arrival -- suppress visited updates until the destination is actually grounded
 local ground = { lv = nil, since = 0, lastSave = 0 }
 local function onGround(pawn)
   local m = pawn.CharacterMovement
@@ -215,6 +286,7 @@ local function onGround(pawn)
   return mode == 1 or mode == 2      -- Walking / NavWalking
 end
 local function taskVisited()
+  if arrival then ground.lv = nil; return end
   local pc, pawn, lv, full = stableWorld(); if not pawn then ground.lv = nil return end
   if not full:find("BP_SceneHero") then ground.lv = nil return end
   if not onGround(pawn) then ground.lv = nil return end
@@ -234,17 +306,25 @@ end
 -- ChangeSceneMap already starts the load; calling task:StartChangeMap() as well loaded the map twice (v4.3 bug).
 -- After arrival a watchdog checks the hero for 25 s; if it is falling / below the target / gone, it is moved
 -- to the level's PlayerStart (the game's own spawn point).
-local arrival = nil   -- { lv, z, at, fallSince, rescued }
 local function changeMap(pc, lv, x, y, z)
   local cdo = StaticFindObject("/Script/JH.Default__AsyncTaskChangeSceneMap")
   return cdo:ChangeSceneMap(pc, FName(lv), { X = x, Y = y, Z = z }, 0, true, true, true, true, false)
 end
+local pendingTravel
 local function taskTeleport()
-  local line = readFirst("teleport.req"); if not line then return end
-  os.remove(DIR .. "teleport.req")
-  local lv, x, y, z = line:match("^([%w_]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)")
+  if not pendingTravel then
+    local line = readFirst("teleport.req"); if not line then return end
+    if not os.remove(DIR .. "teleport.req") then return end
+    pendingTravel = { line = line, untilAt = now() + 1, source = lastLevel }
+  end
+  local req = pendingTravel
+  if inFight or lastMap ~= "1" or lastLevel ~= req.source or now() > req.untilAt then
+    pendingTravel = nil; print("[GamepadTweaks] teleport cancelled: map closed, fight, level change or timeout\n"); return
+  end
+  local pc, pawn, cur, full = stableWorld(); if not pc then return end
+  pendingTravel = nil -- never replay after changing the map
+  local lv, x, y, z = req.line:match("^([%w_]+)|([%-%d%.]+)|([%-%d%.]+)|([%-%d%.]+)")
   if not lv then return end
-  local pc, pawn, cur, full = stableWorld(); if not pc then print("[GamepadTweaks] teleport skipped: world not stable\n") return end
   -- any field pawn may teleport (scene hero, overworld hero BP_WorldHero1_C); never from a fight
   if inFight or full:find("BP_FightSpectator") then print("[GamepadTweaks] teleport skipped: in a fight\n") return end
   local ui = getUI()
@@ -261,41 +341,46 @@ local function taskTeleport()
   arrival = { lv = lv, z = tz, at = now(), fallSince = nil, rescued = false }
   print(string.format("[GamepadTweaks] teleport -> %s (%.0f %.0f %.0f)\n", lv, tx, ty, tz))
 end
-local function playerStart()
+local function playerStart(lv)
   for _, s in ipairs(FindAllOf("PlayerStart") or {}) do
-    if live(s) then local l = s:K2_GetActorLocation(); return l.X, l.Y, l.Z end
+    if live(s) and s:GetFullName():find("." .. lv .. ":PersistentLevel.", 1, true) then
+      local l = s:K2_GetActorLocation(); return l.X, l.Y, l.Z
+    end
   end
-  return nil
 end
 local function taskArrival()
   local a = arrival; if not a then return end
   local t = now() - a.at
-  if t < 3 then return end
-  if t > 25 or a.rescued then arrival = nil return end
-  local pc = FindFirstOf("BP_PlayerController_C"); if not live(pc) then return end
-  local pawn = pc.Pawn
-  local bad, why = false, ""
-  if not pawn or not pawn:IsValid() then
-    if t > 8 then bad, why = true, "hero missing" end
-  else
-    local full = pawn:GetFullName()
-    if not full:find("." .. a.lv .. ":", 1, true) then return end          -- still loading
-    if not full:find("BP_SceneHero") then return end
-    local l = pawn:K2_GetActorLocation()
-    local m = pawn.CharacterMovement
-    local falling = m and m:IsValid() and m:IsFalling()
-    if falling then a.fallSince = a.fallSince or now() else a.fallSince = nil end
-    if l.Z < a.z - 1500 then bad, why = true, string.format("below target (z %.0f)", l.Z)
-    elseif a.fallSince and now() - a.fallSince > 2.5 then bad, why = true, "falling" end
+  if t > 40 or inFight then arrival = nil; return end
+  local pc = FindFirstOf("BP_PlayerController_C"); if not live(pc) or not live(pc.Pawn) then return end
+  local pawn = pc.Pawn; local full = pawn:GetFullName()
+  if not full:find("." .. a.lv .. ":PersistentLevel.", 1, true) or not full:find("BP_SceneHero", 1, true) then
+    if a.seen then arrival = nil end; return
   end
-  if not bad then return end
-  local sx, sy, sz = playerStart()
-  a.rescued = true
-  if not sx then print("[GamepadTweaks] arrival rescue: " .. why .. ", but no PlayerStart found\n") return end
-  pauseUntil = now() + 12
-  changeMap(pc, a.lv, sx, sy, sz + 30)
-  visited[a.lv] = nil; saveVisited()          -- the stored point was bad; re-record on the ground
-  print(string.format("[GamepadTweaks] arrival rescue: %s -> PlayerStart %.0f %.0f %.0f\n", why, sx, sy, sz))
+  local l = pawn:K2_GetActorLocation()
+  -- Ignore the pre-placement pawn seen during a same-level load.
+  if not a.seen and t < 1 then return end
+  a.seen = true
+  local grounded = onGround(pawn)
+  local low = l.Z < a.z - 180
+  if grounded and not low then
+    a.stood = a.stood or now()
+    if now() - a.stood >= 0.6 then
+      if a.rescued then visited[a.lv] = {x=l.X,y=l.Y,z=l.Z}; saveVisited() end
+      arrival = nil
+    end
+    return
+  end
+  a.stood = nil
+  if grounded then a.fallSince = nil else a.fallSince = a.fallSince or now() end
+  if a.rescued or (not low and (not a.fallSince or now() - a.fallSince < 1.5)) then return end
+  local sx, sy, sz = playerStart(a.lv); if not sx then return end
+  if a.tryAt and now() < a.tryAt then return end
+  a.tryAt = now() + 1
+  if pawn:K2_TeleportTo({X=sx,Y=sy,Z=sz+30}, pawn:K2_GetActorRotation()) then
+    pawn.CharacterMovement:StopMovementImmediately(); a.rescued, a.z, a.fallSince = true, sz, nil
+    print(string.format("[GamepadTweaks] arrival rescue in place: %s z %.0f -> %.0f\n", a.lv,l.Z,sz))
+  end
 end
 
 -- ---------------------------------------------------------------- 5) maintenance command channel
@@ -316,7 +401,7 @@ local geomFn = StaticFindObject("/Script/UMG.Widget:GetCachedGeometry")
 local uwClass = StaticFindObject("/Script/UMG.UserWidget")
 local scanReady = nativeScan and nativeCommit and geomFn and geomFn:IsValid() and uwClass and uwClass:IsValid()
 print("[GamepadTweaks] ui scan " .. (scanReady and "ready" or "unavailable") .. "\n")
-local function shownChain(w, memo, depth)
+shownChain = function(w, memo, depth)
   if depth > 40 then return false end
   local key = w:GetAddress()
   local m = memo[key]; if m ~= nil then return m end
@@ -376,6 +461,116 @@ local function taskInteract()
       end
     end
   end
+end
+
+local eachArr -- assigned before the scheduler starts; also used to collect every matching sprite
+-- ---------------------------------------------------------------- 7b) walking appearance, without changing fast-run state/speed/mount buffs
+-- Remap only mounted visuals; ordinary idle/run and frame progression belong to the native sprite.
+-- Followers use a version-checked native renderer copy; the real mount, speed and buffs are never toggled.
+local WALK = { on = false, pawn = nil, targets = {}, originals = {}, findAt = 0, cfgAt = 0, cfg = false,
+  rebuildAt = 0, followerCount = nil, bridge = package.loadlib(DLLPATH, "wsmod_walk_rebuild"), warned = false }
+-- The native renderer indexes FastRunFlipbooks and RunFlipbooks by the same facing.
+-- Override instance slots, not shared assets. A later native state=9 then selects the
+-- same flipbook as state=2, so switching states does not reset playback to frame zero.
+function WALK.slots(sprite, saved, restore)
+  if sprite.bShipType then return end
+  local run, fast = sprite.RunFlipbooks, sprite.FastRunFlipbooks
+  if not run or not fast then return end
+  fast:ForEach(function(i, slot)
+    local current = slot:get(); if not current or not current:IsValid() then return end
+    local old = saved[i]
+    if restore then
+      if old and current:GetAddress() == old.applied then
+        local orig = old.asset
+        if not orig:IsValid() then orig = LoadAsset(old.path) end
+        if orig and orig:IsValid() then slot:set(orig) end
+      end
+    elseif i <= #run then
+      local normal = run[i]
+      if normal and normal:IsValid() and normal:GetAddress() ~= current:GetAddress() then
+        if not old or current:GetAddress() ~= old.applied then
+          old = { asset = current, path = current:GetFullName():match('%S+ (.+)') }; saved[i] = old
+        end
+        slot:set(normal); old.applied = normal:GetAddress()
+      end
+    end
+  end)
+end
+local function walkApply()
+  if not WALK.on then return end
+  for _, target in ipairs(WALK.targets) do
+    local actor, sprite = target.actor, target.sprite
+    if live(actor) and live(sprite) then
+      if sprite.DefaultRunAnimalState == 9 then sprite.DefaultRunAnimalState = 2 end
+      if sprite.DefaultIdleAnimalState == 9 then sprite.DefaultIdleAnimalState = 1 end
+      -- Keep the game's animation driver: followers can move by transform with
+      -- zero reported velocity. Never overwrite ordinary idle/run every tick.
+      if sprite.AnimalState == 9 then sprite.AnimalState = 2 end
+      if target.hero and not sprite.bShipType and sprite.AnimalState == 2 and not sprite:IsPlaying() then
+        sprite:SetLooping(true); sprite:Play() -- resume, never PlayFromStart every tick
+      end
+    end
+  end
+end
+local function taskWalkAppearance()
+  local pc, pawn, lv, full = stableWorld(); if not pc then return end
+  if inFight or not (full:find("BP_SceneHero", 1, true) or full:find("BP_WorldHero", 1, true)) then return end
+  if now() >= WALK.cfgAt then WALK.cfg, WALK.cfgAt = iniNumber("walk_appearance", 0) == 1, now() + 1 end
+  if WALK.pawn ~= pawn:GetAddress() then
+    WALK.pawn, WALK.targets, WALK.originals, WALK.findAt, WALK.on, WALK.followerCount, WALK.rebuildAt = pawn:GetAddress(), {}, {}, 0, false, nil, 0
+  end
+  if not WALK.cfg then
+    if WALK.on then
+      WALK.on = false
+      for _, original in ipairs(WALK.originals) do
+        if live(original.sprite) then
+          if next(original.slots) then WALK.slots(original.sprite, original.slots, true) end
+          original.sprite.bAutoCalcRunOrIdleState = original.auto
+          original.sprite.DefaultRunAnimalState, original.sprite.DefaultIdleAnimalState = original.run, original.idle
+        end
+      end
+      if WALK.followerCount then pawn.FollowerCount = WALK.followerCount end
+      pawn:RebuidFollowers(); pawn:KeepFastRunState() -- restore today's real fast-run state, not a cached old one
+      WALK.targets, WALK.originals = {}, {}
+      print("[GamepadTweaks] walking appearance: off (native display restored)\n")
+    end
+    return
+  end
+  if not WALK.on then
+    WALK.on, WALK.followerCount = true, tonumber(pawn.FollowerCount)
+    if WALK.followerCount then pawn.FollowerCount = math.max(5, WALK.followerCount) end
+    print("[GamepadTweaks] walking appearance: on (speed/effects unchanged)\n")
+  end
+  if now() >= WALK.findAt then
+    WALK.findAt, WALK.targets = now() + 0.1, {}
+    local cls = StaticFindObject("/Script/JH.JHPaperFlipbookComponent")
+    if not cls or not cls:IsValid() then return end
+    local function add(actor)
+      if not live(actor) then return end
+      eachArr(actor:K2_GetComponentsByClass(cls), function(i, sprite)
+        if not live(sprite) then return end
+        local known
+        for _, original in ipairs(WALK.originals) do if live(original.sprite) and original.sprite:GetAddress() == sprite:GetAddress() then known = original; break end end
+        if not known then known = { sprite = sprite, auto = sprite.bAutoCalcRunOrIdleState, slots = {},
+          run = sprite.DefaultRunAnimalState, idle = sprite.DefaultIdleAnimalState }; WALK.originals[#WALK.originals + 1] = known end
+        if actor == pawn then WALK.slots(sprite, known.slots, false) end
+        WALK.targets[#WALK.targets + 1] = { actor = actor, sprite = sprite, hero = actor == pawn }
+      end)
+    end
+    add(pawn)
+    local heroSprites = #WALK.targets
+    local count = 0
+    eachArr(pawn.FollowCharacters, function(i, actor) if live(actor) then count = count + 1; add(actor) end end)
+    local report = string.format("%s heroSprites=%d followers=%d", lv, heroSprites, count)
+    if report ~= WALK.report then WALK.report = report; print("[GamepadTweaks] walking: " .. report .. "\n") end
+    if count == 0 and now() >= WALK.rebuildAt then
+      WALK.rebuildAt = now() + 2 -- no per-frame spawning; native story/scene guards are kept
+      if WALK.bridge then
+        if writeFile("walk_actor.txt", string.format("%x", pawn:GetAddress())) then WALK.bridge(); WALK.findAt = 0 end
+      elseif not WALK.warned then WALK.warned = true; print("[GamepadTweaks] walking followers: bridge missing (old DLL)\n") end
+    end
+  end
+  walkApply()
 end
 
 -- ---------------------------------------------------------------- 8) battle detection -> battle.flag
@@ -443,9 +638,7 @@ local BTN_SORT_EVT = "BndEvt__BPMV_JHBackpack_Basic_BTN_BackpackSort_K2Node_Comp
 local POPUP_KEYS = { [1] = "VE0", [2] = "VE0_1", [3] = "VE0_2", [4] = "VE0_3" }   -- st_id 1 珍贵 2 时间 3 价钱 4 类型
 -- highlight colour: [backpack] highlight_rgb = sRGB hex (default 5C6CFF, blue-violet); UMG wants linear colour
 local function iniString(key, def)
-  local s = readFirst("wsmod.ini"); if not s then return def end
-  s = s:gsub("%z", "")
-  return s:match("\n%s*" .. key .. "%s*=%s*#?([%x]+)") or def
+  local v = config.get(key); return v and v:match("^#?(%x+)") or def
 end
 local function toLinear(v) v = v / 255; if v <= 0.04045 then return v / 12.92 end return ((v + 0.055) / 1.055) ^ 2.4 end
 local hlHex, hlColor = nil, nil
@@ -461,7 +654,7 @@ local function highlightColor()
 end
 local WHITE = { R = 1.0, G = 1.0, B = 1.0, A = 1.0 }
 
-local function eachArr(arr, fn)
+eachArr = function(arr, fn)
   if arr == nil then return end
   if type(arr) == "table" then for i, e in ipairs(arr) do if type(e) == "userdata" and e.get then e = e:get() end fn(i, e) end
   elseif arr.ForEach then arr:ForEach(function(i, e) fn(i, e:get()) end) end
@@ -471,6 +664,17 @@ end
 local reqCache = nil
 local kindCache = {}     -- defId -> { sub, skill }  for books (30-38), materials (40-49), treasures (50-56), quest items (60), recipes (99)
 local baseCache = {}
+local weaponLimits = nil -- NPCs.WeaponLimits, not the character's currently equipped weapon
+local function buildWeaponLimits()
+  weaponLimits = {}
+  local dt = StaticFindObject("/Game/JH/Tables/NPCs.NPCs")
+  if not live(dt) then weaponLimits = nil; return end
+  dt:ForEachRow(function(name, row)
+    local allowed = {}
+    eachArr(row.WeaponLimits, function(i, v) local t = tonumber(v); if t then allowed[t] = true end end)
+    weaponLimits[row.ID] = allowed
+  end)
+end
 local function buildReqCache()
   reqCache = {}
   local dt = StaticFindObject("/Game/JH/Tables/Items.Items"); if not dt or not dt:IsValid() then return end
@@ -491,7 +695,13 @@ local function buildReqCache()
   end)
 end
 local function canUse(defId, npc)
+  if not npc or npc < 0 then return true end
   local e = reqCache[defId]; if not e then return true end
+  if e.sub >= 1 and e.sub <= 6 then
+    if not weaponLimits then buildWeaponLimits() end
+    local allowed = weaponLimits and weaponLimits[npc]
+    if allowed and not allowed[e.sub] then return false end
+  end
   local onlyList = nil
   for _, r in ipairs(e.req) do
     if r.t == 13 and npc ~= 0 then return false end              -- OnlyHero
@@ -537,17 +747,23 @@ local function better(new, old, mode)
   return up and not down                        -- "strict": nothing lower, something higher
 end
 
+local function teamNpcFromJson(js)
+  local idx = tonumber(js:match('"focus_npc_index"%s*:%s*(%-?%d+)'))
+  if not idx then return -1 end
+  for blk in js:gmatch('{[^{}]-}') do
+    if tonumber(blk:match('"index"%s*:%s*(%-?%d+)')) == idx then
+      local id = tonumber(blk:match('"npc_id"%s*:%s*(%-?%d+)'))
+      if id and id >= 0 then return id end
+    end
+  end
+  return -1                    -- unknown focus: do not filter as if the hero were selected
+end
 local function focusedNpc()
   local ov = readFirst("npc_override.txt"); if ov and tonumber(ov) then return tonumber(ov) end
-  local tv = nil
-  for _, v in ipairs(FindAllOf("TeamModuleVM") or {}) do if live(v) then tv = v end end
-  if not tv then return 0 end
-  local js = tv.RootData:DataToString():ToString()
-  local idx = tonumber(js:match('"focus_npc_index":(%-?%d+)')) or 0
-  for blk in js:gmatch('{[^{}]-"index":' .. idx .. '[^{}]-}') do
-    local id = tonumber(blk:match('"npc_id":(%-?%d+)')); if id and id >= 0 then return id end
+  for _, v in ipairs(FindAllOf("TeamModuleVM") or {}) do
+    if live(v) then return teamNpcFromJson(v.RootData:DataToString():ToString()) end
   end
-  return 0
+  return -1
 end
 local function wornStats(npc)
   local res = {}
@@ -566,6 +782,116 @@ local function gridItems(grid)
   if type(items) == "table" then for _, sp in ipairs(items) do if type(sp) == "userdata" and sp.get and not sp.IsValid then sp = sp:get() end out[#out + 1] = sp end
   elseif items and items.ForEach then items:ForEach(function(i, e) out[#out + 1] = e:get() end) end
   return out
+end
+
+-- Gift eligibility is receiver-specific, not the ordinary backpack's weapon/learnability cache.
+local ensureCellHook
+local GIFT = { vm = nil, grid = nil, addr = nil, npc = -1, favor = nil, nextRead = 0, enabled = true,
+  bridge = package.loadlib(DLLPATH, "wsmod_gift_context"), defs = {}, gone = {}, warned = false, hobbies = nil }
+local function giftHidden(sp)
+  if not GIFT.enabled or not live(sp) then return false end
+  local id = sp.ItemDefId
+  if not id or id <= 0 then return false end
+  if sp.bIsLocked or sp.bOnlyForLayout then return true end
+  local def = GIFT.defs[id]
+  if not def then
+    local ok, d = pcall(function() return sp:GetDef() end)
+    if not ok or type(d) ~= "table" then return false end
+    def = { cant = d.bCantGift == true, quality = tonumber(d.Quality), sub = tonumber(d.ItemType) }; GIFT.defs[id] = def
+  end
+  if def.cant then return true end
+  if GIFT.hobbies and def.sub and not GIFT.hobbies[def.sub] then return true end
+  if GIFT.favor == nil or def.quality == nil then return false end -- unknown receiver/version: preserve items
+  -- v1.24.32's native gift-quality predicate (0x1122f20): abs(relationship tier) + 1 is the minimum quality.
+  local f, tier = GIFT.favor, 0
+  if f <= -80 then tier = 4 elseif f <= -60 then tier = 3 elseif f <= -40 then tier = 2 elseif f <= -20 then tier = 1
+  elseif f >= 80 then tier = 4 elseif f >= 60 then tier = 3 elseif f >= 40 then tier = 2 elseif f >= 20 then tier = 1 end
+  return def.quality < tier + 1
+end
+local function giftItemKey(sp)
+  if not live(sp) then return nil end
+  local ok, id = pcall(function() return sp:GetId():ToString() end)
+  return ok and id or tostring(sp.ItemDefId)
+end
+local function giftEntryInit(self, item, widget)
+  if not GIFT.addr then return end
+  local g, sp, en = self:get(), item:get(), widget:get()
+  if live(g) and g:GetAddress() == GIFT.addr and live(en) then en:SetRenderOpacity(giftHidden(sp) and 0 or 1) end
+end
+local function giftFilter()
+  local grid = GIFT.grid; if not live(grid) then return end
+  local gone = {}
+  for _, sp in ipairs(gridItems(grid)) do
+    if live(sp) and giftHidden(sp) then gone[sp:GetAddress()] = true; grid:RemoveItem(sp) end
+  end
+  GIFT.gone = gone
+  for _, en in ipairs(FindAllOf("BPEntry_Item_WDT_Gift_C") or {}) do
+    if live(en) then
+      local sp = en:GetBindedDataObj()
+      if live(sp) then en:SetRenderOpacity((gone[sp:GetAddress()] or giftHidden(sp)) and 0 or 1) end
+    end
+  end
+end
+local function taskGift()
+  if not stableWorld() or inFight then GIFT.vm, GIFT.grid, GIFT.addr = nil, nil, nil; return end
+  local vm = GIFT.vm
+  if not live(vm) or not vm:GetModuleVisibility() then
+    vm = nil
+    for _, v in ipairs(FindAllOf("JHMainCharacterGiftBackpackVM") or {}) do
+      if live(v) and v:GetModuleVisibility() then vm = v; break end
+    end
+  end
+  if not vm then GIFT.vm, GIFT.grid, GIFT.addr, GIFT.favor = nil, nil, nil, nil; return end
+  ensureCellHook()
+  local opened = not GIFT.vm or GIFT.vm:GetAddress() ~= vm:GetAddress()
+  if opened then
+    local view = vm:GetPairView(); if not live(view) or not live(view.GRID_ITEM) then return end
+    GIFT.vm, GIFT.grid, GIFT.addr = vm, view.GRID_ITEM, view.GRID_ITEM:GetAddress()
+    GIFT.npc, GIFT.favor, GIFT.nextRead = -1, nil, 0
+  end
+  if now() >= GIFT.nextRead then
+    GIFT.nextRead = now() + 0.5
+    local enabled, npc, favor, hobbies = iniNumber("gift_hide_unavailable", 1) == 1, -1, nil, nil
+    if GIFT.bridge then
+      local address = string.format("%x", vm:GetAddress())
+      local cleared, _, errno = os.remove(DIR .. "gift_context.txt")
+      if (cleared or errno == 2) and writeFile("gift_vm.txt", address) then -- ENOENT is also fresh
+        GIFT.bridge()
+        local result = readFirst("gift_context.txt") or ""
+        local seen, value = result:match("^(%x+)|(%-?%d+)")
+        if seen == address then npc = tonumber(value) or -1 end
+      end
+    elseif not GIFT.warned then
+      GIFT.warned = true; print("[GamepadTweaks] gift: receiver bridge missing; quality filtering disabled (old DLL)\n")
+    end
+    if npc >= 0 then
+      local lib = StaticFindObject("/Script/JH.Default__NPCFuncLib")
+      if lib and lib:IsValid() then
+        local ok, f = pcall(function() return lib:GetFriendliness(npc) end); if ok then favor = tonumber(f) end
+        local good, h = pcall(function()
+          local raw = lib:GetNPCHobbies(npc); if raw == nil then return nil end
+          local out = {}; eachArr(raw, function(i, v) local t = tonumber(v); if t then out[t] = true end end)
+          return out
+        end)
+        if good then hobbies = h end
+      end
+    end
+    local keys = {}; for t in pairs(hobbies or {}) do keys[#keys + 1] = t end; table.sort(keys)
+    local hobbySig = hobbies and table.concat(keys, ",") or "unknown"
+    local changed = opened or enabled ~= GIFT.enabled or npc ~= GIFT.npc or favor ~= GIFT.favor or hobbySig ~= GIFT.hobbySig
+    GIFT.enabled, GIFT.npc, GIFT.favor, GIFT.hobbies, GIFT.hobbySig = enabled, npc, favor, hobbies, hobbySig
+    if changed then
+      -- Recompute is_fav through the game's receiver-aware converter. Keep the selected item if still available.
+      local selected = GIFT.grid:GetSelectedItem(); local key = giftItemKey(selected)
+      local index = live(selected) and GIFT.grid:GetIndexForItem(selected) or 0
+      vm:HandleBackpackBatchChange(); giftFilter()
+      local items = gridItems(GIFT.grid); local pick = nil
+      if key then for _, sp in ipairs(items) do if live(sp) and giftItemKey(sp) == key then pick = sp; break end end end
+      if not pick and #items > 0 then pick = items[math.min(math.max((index or 0) + 1, 1), #items)] end
+      if pick then GIFT.grid:SetSelectedItem(pick) end
+    end
+  end
+  giftFilter() -- game-driven sort/filter/item changes are filtered too; no address-keyed eligibility cache
 end
 
 local bp = { open = false, sortDone = false, openAt = 0, npc = nil, filter = nil, lit = {} }
@@ -634,15 +960,14 @@ local function teamNpcs()
   return out
 end
 local function decide(npc, defId)
+  if not npc or npc < 0 then return false end
   local m = HIDE.memo[npc]; if not m then m = {}; HIDE.memo[npc] = m end
   local d = m[defId]; if d ~= nil then return d end
   d = false
   local e, k = reqCache[defId], kindCache[defId]
   if e then
-    if not canUse(defId, npc) then d = "u"
-    elseif npc ~= 0 and e.sub >= 1 and e.sub <= 6 then
-      local wt = weaponType(npc); if wt > 0 and e.sub ~= wt then d = "u" end      -- teammates: only their weapon type
-    end
+    -- Use the NPCs row's full WeaponLimits plus explicit item requirements, never a stale grey cell.
+    if not canUse(defId, npc) then d = "u" end
   elseif k then
     if k.sub >= 30 and k.sub <= 38 then
       local info = teamInfo(npc); local has = false
@@ -657,7 +982,7 @@ local function decide(npc, defId)
     elseif k.sub == 99 and HIDE.recipeDone[defId] then d = "a"                  -- learned recipe
     end
   end
-  if d == false then local dm = HIDE.dim[npc]; if dm and dm[defId] then d = "u" end end   -- the game greyed it out before
+  if d == false and not e then local dm = HIDE.dim[npc]; if dm and dm[defId] then d = "u" end end   -- learned only for non-equipment
   m[defId] = d
   return d
 end
@@ -667,18 +992,31 @@ local function isHidden(npc, filter, defId)
   if d == "a" then return HIDE.cfgTidy and filter == 0 end
   return false
 end
+local function observeNpcFromJson(js)
+  local found = nil
+  for id in js:gmatch('"npc_id"%s*:%s*(%-?%d+)') do
+    id = tonumber(id)
+    if found ~= nil and found ~= id then return -1 end
+    found = id
+  end
+  return found or -1 -- never substitute the team tab's selected NPC for the observed character
+end
+local function observeGreyWeapon(npc, defId, js)
+  if npc >= 0 or not HIDE.context or not HIDE.cfgHide then return false end
+  local e = reqCache[defId]
+  -- Only the active observed grid's current, ID-matched display data; never learn equipment greyness.
+  return e and e.sub >= 1 and e.sub <= 6 and js:find('"not_learnable":true', 1, true) ~= nil or false
+end
 -- current character / tab, re-read at most once per 3 ms (one read per batch of cells)
 local function current()
   local t = os.clock()
   if t - HIDE.cacheAt > 0.003 then
     HIDE.cacheAt = t
-    local npc = 0
+    local npc = -1
     local tv = HIDE.team
-    if tv and tv:IsValid() then
-      local js = tv.RootData:DataToString():ToString()
-      local idx = tonumber(js:match('"focus_npc_index":(%-?%d+)')) or 0
-      for blk in js:gmatch('{[^{}]-"index":' .. idx .. '[^{}]-}') do local id = tonumber(blk:match('"npc_id":(%-?%d+)')); if id and id >= 0 then npc = id end end
-    end
+    if HIDE.context and live(HIDE.context) then
+      npc = observeNpcFromJson(HIDE.context.RootData:DataToString():ToString())
+    elseif tv and tv:IsValid() then npc = teamNpcFromJson(tv.RootData:DataToString():ToString()) end
     if t - (HIDE.ovAt or -1) > 0.5 then HIDE.ovAt = t; local ov = readFirst("npc_override.txt"); HIDE.ov = ov and tonumber(ov) or nil end
     if HIDE.ov then npc = HIDE.ov end
     -- active tab = vm:GetFilterIndex() (EBackpackFilterType_Console: 0 全部 1 武器 2 防具 3 丹药 4 秘籍 5 材料 6 珍宝 7 任务).
@@ -705,11 +1043,24 @@ local function onEntryInit(self, item, widget)
   if not sp.bOnlyForLayout then local npc, filter = current(); hid = isHidden(npc, filter, sp.ItemDefId) end
   w:SetRenderOpacity(hid and 0 or 1)
 end
+ensureCellHook = function()
+  if HIDE.hooked or iniNumber("cell_hook", 1) ~= 1 then return end
+  local fn = StaticFindObject(HOOK_FN); if not fn or not fn:IsValid() then return end
+  local ok, err = pcall(function()
+    RegisterHook(HOOK_FN, function(self, item, widget)
+      pcall(onEntryInit, self, item, widget)
+      pcall(giftEntryInit, self, item, widget)
+    end)
+  end)
+  HIDE.hooked = ok
+  print("[GamepadTweaks] backpack/gift: cell hook " .. (ok and "registered" or ("failed: " .. tostring(err))) .. "\n")
+end
 local function onOpen(vm)
   local view = vm:GetPairView(); if not view or not view:IsValid() then return false end
   HIDE.view, HIDE.grid, HIDE.vn = view, view.GRID_ITEM, view:GetFName():ToString()
   HIDE.gridAddr = HIDE.grid:GetAddress()
-  HIDE.team = nil; for _, v in ipairs(FindAllOf("TeamModuleVM") or {}) do if live(v) then HIDE.team = v end end
+  HIDE.team = nil
+  if not HIDE.context then for _, v in ipairs(FindAllOf("TeamModuleVM") or {}) do if live(v) then HIDE.team = v end end end
   HIDE.btns = {}
   for _, b in ipairs(FindAllOf("BP_BackpackFilterBtn_C") or {}) do
     if live(b) and b:GetFullName():find(HIDE.vn, 1, true) then local n = b:GetFName():ToString(); HIDE.btns[#HIDE.btns + 1] = { obj = b, name = n, all = (n == "Btn_All") } end
@@ -724,29 +1075,44 @@ local function onOpen(vm)
   local t0 = os.clock()
   local ids = {}
   vm.CurrentDataSrc:ForEach(function(i, e) ids[e:get().ItemDefId] = true end)
-  local npcs = teamNpcs()
+  local npcs = HIDE.context and { (current()) } or teamNpcs()
   for _, npc in ipairs(npcs) do
-    local wt = weaponType(npc)
-    if HIDE.dimWt[npc] ~= nil and HIDE.dimWt[npc] ~= wt then HIDE.dim[npc] = nil end   -- weapon changed: forget greyed list
-    HIDE.dimWt[npc] = wt
-    for id in pairs(ids) do decide(npc, id) end
+    if npc >= 0 then
+      local wt = weaponType(npc)
+      if HIDE.dimWt[npc] ~= nil and HIDE.dimWt[npc] ~= wt then HIDE.dim[npc] = nil end   -- weapon changed: forget greyed list
+      HIDE.dimWt[npc] = wt
+      for id in pairs(ids) do decide(npc, id) end
+    end
   end
-  if not HIDE.hooked and iniNumber("cell_hook", 1) == 1 then
-    HIDE.hooked = true
-    local ok, err = pcall(function() RegisterHook(HOOK_FN, function(self, item, widget) pcall(onEntryInit, self, item, widget) end) end)
-    print("[GamepadTweaks] backpack: cell hook " .. (ok and "registered" or ("failed: " .. tostring(err))) .. "\n")
-  end
+  ensureCellHook()
   print(string.format("[GamepadTweaks] backpack: preloaded %d characters x %d items in %.1f ms\n", #npcs, (function() local n = 0 for _ in pairs(ids) do n = n + 1 end return n end)(), (os.clock() - t0) * 1000))
   return true
 end
 local function taskHide()
   if inFight then HIDE.open = false return end
   local vm = HIDE.vm
-  if not (vm and vm:IsValid()) then
-    if now() < HIDE.findAt then return end
-    HIDE.findAt = now() + 1
-    vm = nil; for _, v in ipairs(FindAllOf("JHMainCharacterBackpackInTeamVM") or {}) do if live(v) then vm = v end end
-    HIDE.vm = vm; if not vm then return end
+  local visible = live(vm) and vm:GetModuleVisibility()
+  if not visible and now() < HIDE.findAt then HIDE.open = false; return end
+  if not visible or now() >= HIDE.findAt then
+    HIDE.findAt = now() + 0.25
+    local picked, context = nil, nil
+    for _, view in ipairs(FindAllOf("BPMV_Observe_C") or {}) do
+      if live(view) and view:IsVisible() then
+        local parent = view:GetNeoUIVM()
+        if live(parent) then
+          local child = parent:GetSubModuleByKey(FName("Backpack"))
+          if live(child) and child:GetModuleVisibility() then picked, context = child, parent; break end
+        end
+      end
+    end
+    if not picked then
+      for _, v in ipairs(FindAllOf("JHMainCharacterBackpackInTeamVM") or {}) do
+        if live(v) and v:GetModuleVisibility() then picked = v; break end
+      end
+    end
+    if not picked then HIDE.open, HIDE.vm, HIDE.context = false, nil, nil; return end
+    if not live(vm) or vm:GetAddress() ~= picked:GetAddress() then HIDE.open = false end
+    vm, HIDE.vm, HIDE.context = picked, picked, context
   end
   if not vm:GetModuleVisibility() then HIDE.open = false return end
   if not HIDE.open then
@@ -784,7 +1150,8 @@ local function taskHide()
         local sid = tonumber(js:match('"setting_id":(%d+)'))
         if sid == sp.ItemDefId and not gone[addr] then
           local newly = false
-          if js:find('"not_learnable":true', 1, true) and decide(npc, sid) == false then
+          if observeGreyWeapon(npc, sid, js) then grid:RemoveItem(sp); gone[addr] = true; learnt = learnt + 1 end
+          if npc >= 0 and not reqCache[sid] and js:find('"not_learnable":true', 1, true) and decide(npc, sid) == false then
             HIDE.dim[npc] = HIDE.dim[npc] or {}; HIDE.dim[npc][sid] = true; HIDE.memo[npc][sid] = "u"; newly = true
           elseif js:find('"is_recipe":true', 1, true) and js:find('"is_acquired":true', 1, true) and not HIDE.recipeDone[sid] then
             HIDE.recipeDone[sid] = true; for _, mm in pairs(HIDE.memo) do mm[sid] = nil end; newly = true
@@ -844,6 +1211,7 @@ local function taskBackpack()
   end
   -- 2) highlight better equipment on the visible entries
   local npc = focusedNpc()
+  if npc < 0 then resetEntries(); return end
   if bp.npc ~= nil and npc ~= bp.npc then resetEntries() end
   bp.npc = npc
   if not mark then if next(bp.lit) then resetEntries() end return end
@@ -1028,7 +1396,7 @@ function navMask(m)
     end
   else
     local on = m ~= 0
-    if on ~= NAV.flag then NAV.flag = on; writeFile("prime.flag", on and "1" or "0") end
+    if on ~= NAV.flag and writeFile("prime.flag", on and "1" or "0") then NAV.flag = on end
   end
   NAV.mask = m
 end
@@ -1293,20 +1661,24 @@ local function taskPadEv() PADEV = navPadEvents() end
 -- The game's speed button only toggles x1 / x2: it sets the persistent level's WorldSettings.TimeDilation to
 -- 1.0 / 2.0 (measured 2026-11-23; nothing else changes) and shows BTN_SpeedUp1 (x1 icon) or BTN_SpeedUp2 (x2).
 -- 速战 (quick battle): the game's own auto battle (view:EnableAutoBattle) + TimeDilation held at quick_speed
--- (default 50; MaxGlobalTimeDilation raised for it). The fight is still played out by the game - win or lose -,
+-- (default 500, configurable up to 1000; MaxGlobalTimeDilation raised if needed). The fight is still played out by the game - win or lose -,
 -- only compressed: 1v1 sparring took 6-10 s at x2 and 0.6-2.3 s at x20/x50/x100 (9 fights, no stalls).
 -- Mouse speed-button hooks and the proxy's single-Y events advance the same cycle, not icon changes:
 -- x1 -> x2 -> 速战 -> x1. The game restores its icon during fight startup and cut-ins; that is not a press.
 -- Our own icon corrections are guarded so they cannot advance the cycle. Early presses are queued until the
 -- battle view is ready. Auto battle is switched off again only if we switched it on. The level is kept for
--- the next fight. Watchdog: 速战 longer than quick_timeout s falls back to x2, keeping auto battle on.
+-- the next fight. Watchdog: real-time quick_timeout (max 30 s) releases effects and restores x1 / our auto change.
 -- quick_mask = 1 covers the flickering battle; quick_mute = 1 temporarily mutes only this game's audio session.
 -- Both native effects have a 500 ms heartbeat: a Lua restart or stopped loop releases them automatically.
 -- Reads only widget visibility and simple values; no struct/slot reads (those crashed UE4SS, 2026-11-23 12:20).
+local taskSpeed, spdRecover
+do
+local function now() return RUNTIME.clock end -- monotonic milliseconds from the native owner receipt
 local SPD_Q = 3
 local SPD = { view = nil, ws = nil, findAt = 0, active = false, on = nil, level = 1, mem = 1, written = nil,
-  overwrites = 0, exports = nil, quick = true, qspeed = 50, qtimeout = 90, qStart = nil, qClock = nil, autoByUs = false, mask = true,
-  mute = true, correcting = false, presses = 0, padPresses = 0, hooks = {}, hookAt = 0, maxOrig = nil, over = false, resAt = 0 }
+  overwrites = 0, exports = nil, quick = true, qspeed = 500, qtimeout = 10, qStart = nil, qClock = nil, autoByUs = false, mask = true,
+  mute = true, correcting = false, presses = 0, padPresses = 0, hooks = {}, hookAt = 0, maxOrig = nil, over = false, resAt = 0,
+  fightKey = nil, pressFight = nil, pc = nil, lostAt = nil, recovered = false }
 do                                                                     -- level kept across mod / game restarts
   local m = tonumber((readFirst("speed_level.txt") or ""):match("%d") or "")
   if m and m >= 1 and m <= 3 then SPD.mem = m end
@@ -1323,8 +1695,8 @@ do
   print("[GamepadTweaks] speed: gamepad input bridge " .. (SPD.padOn and SPD.padOff and "available" or "missing (old xinput1_3.dll)") .. "\n")
 end
 local function spdPadInput(on)
-  if on then if SPD.padOn then SPD.padOn() end
-  elseif SPD.padOff then SPD.padOff() end
+  if on then if SPD.padOn then RUNTIME.call(SPD.padOn) end
+  elseif SPD.padOff then RUNTIME.call(SPD.padOff) end
 end
 local function spdBadge(n) if SPD.exports and SPD.exports[n] then SPD.exports[n]() end end
 local function spdMute(on)
@@ -1349,14 +1721,19 @@ local function spdSetGame(v, on)
   SPD.on = spdGameOn(v)
 end
 local function spdFightPawn()
-  local pc = FindFirstOf("BP_PlayerController_C"); if not live(pc) then return false end
-  local pawn = pc.Pawn; if not live(pawn) then return false end
-  return pawn:GetFullName():find("BP_FightSpectator") ~= nil
+  for _, pc in ipairs(FindAllOf("BP_PlayerController_C") or {}) do
+    if live(pc) and live(pc.Pawn) then
+      local key = pc.Pawn:GetFullName()
+      if key:find("BP_FightSpectator", 1, true) then return true, key, pc end
+    end
+  end
+  return false
 end
 local function spdQueuePress(v)
-  if not live(v) or not spdFightPawn() then return end
+  if not runtimePoll() or not live(v) then return end
+  local fight, key = spdFightPawn(); if not fight or (SPD.over and key == SPD.fightKey) then return end
   local a = v:GetAddress()
-  if SPD.pressView ~= a then SPD.pressView, SPD.presses = a, 0 end
+  if SPD.pressView ~= a or SPD.pressFight ~= key then SPD.pressView, SPD.pressFight, SPD.presses = a, key, 0 end
   SPD.presses = SPD.presses + 1
 end
 local function spdInstallHooks()
@@ -1370,7 +1747,7 @@ local function spdInstallHooks()
       if fn and fn:IsValid() then
         local ok, err = pcall(function()
           RegisterHook(path, function(self)
-            if SPD.correcting or SPD.over then return end
+            if SPD.correcting then return end
             local good, e = pcall(function()
               spdQueuePress(self:get())
             end)
@@ -1385,7 +1762,7 @@ local function spdInstallHooks()
   end
 end
 local function spdFindWS()
-  local pc = FindFirstOf("BP_PlayerController_C"); if not live(pc) then return nil end
+  local pc = SPD.pc; if not live(pc) then return nil end
   local lv = pc:GetFullName():match("%.([%w_]+):PersistentLevel"); if not lv then return nil end
   for _, o in ipairs(FindAllOf("WorldSettings") or {}) do
     if live(o) then
@@ -1405,12 +1782,15 @@ local function spdAutoMark(on)
 end
 local function spdAuto(v, on)
   local ok, isAuto = pcall(function() return v:BtnAutoBattleFlagIsAuto() end)
-  if not ok then return end
+  if not ok or type(isAuto) ~= "boolean" then return false end
   if on and not isAuto then
     local done = pcall(function() v:EnableAutoBattle() end); if done then spdAutoMark(true) end
   elseif not on and isAuto and SPD.autoByUs then
-    local done = pcall(function() v:DisableAutoBattle() end); if done then spdAutoMark(false) end
+    pcall(function() v:DisableAutoBattle() end)
   elseif not on then spdAutoMark(false) end
+  local read, actual = pcall(function() return v:BtnAutoBattleFlagIsAuto() end)
+  if not on and read and actual == false then spdAutoMark(false) end
+  return read and actual == on
 end
 local function spdName(l) return l == SPD_Q and "速战" or ("x" .. l) end
 local function spdEnd()
@@ -1420,7 +1800,7 @@ local function spdEnd()
     if SPD.view and SPD.view:IsValid() then spdAuto(SPD.view, false) end
     local ws = SPD.ws
     if ws and ws:IsValid() then
-      if SPD.written and math.abs(ws.TimeDilation - SPD.written) < 0.01 then ws.TimeDilation = 1.0 end
+      if SPD.written then ws.TimeDilation = 1.0 end
       if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig end
     end
     local dur = SPD.qStart and (os.time() - SPD.qStart) or nil
@@ -1429,8 +1809,25 @@ local function spdEnd()
   end
   SPD.active, SPD.view, SPD.ws, SPD.on, SPD.written, SPD.qStart, SPD.maxOrig = false, nil, nil, nil, nil, nil, nil
   SPD.over, SPD.qClock, SPD.seen, SPD.pressView, SPD.presses, SPD.padPresses = false, nil, nil, nil, 0, 0
-  SPD.findAt = 0
+  SPD.findAt, SPD.fightKey, SPD.pressFight, SPD.pc, SPD.lostAt = 0, nil, nil, nil, nil
+  SPD.resultReady, SPD.recovered, SPD.startWait = false, false, nil
   spdBadge(0)
+end
+-- Always release native effects first. This path must run before any HUD/icon readiness return.
+spdRecover = function(reason)
+  spdMute(false); spdBadge(0); spdPadInput(false)
+  if live(SPD.view) then pcall(spdAuto, SPD.view, false) end
+  local ws = SPD.ws
+  if live(ws) then
+    pcall(function()
+      ws.TimeDilation = 1.0
+      if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig end
+    end)
+  end
+  SPD.level, SPD.qStart, SPD.qClock, SPD.maxOrig, SPD.written = 1, nil, nil, nil, nil
+  SPD.presses, SPD.padPresses, SPD.recovered = 0, 0, true
+  spdRemember(1)
+  print("[GamepadTweaks] speed: recovery -> x1/manual (" .. reason .. ")\n")
 end
 -- result screen up: the fight is decided, stop holding the speed (the screen's own animations run normally)
 local function spdResult()
@@ -1439,21 +1836,39 @@ local function spdResult()
   end
   return nil
 end
-local function taskSpeed()
+taskSpeed = function()
   spdInstallHooks()
-  -- Arm the proxy from the real pawn, not battle.flag (also true on the overworld).
-  -- PADEV is read once by taskPadEv; do not consume the navigation event file a second time.
-  local fight = spdFightPawn()
-  if fight and not SPD.over then
-    spdPadInput(true)
-    if PADEV then local _, n = PADEV:gsub("Y", ""); SPD.padPresses = SPD.padPresses + n end
-  else spdPadInput(false); SPD.padPresses = 0 end
-  -- taskBattle runs every 300 ms. A real button press can arrive before that poll sees the new fight.
-  if not inFight then
-    if fight then inFight = true
-    else if SPD.active or SPD.view or SPD.presses > 0 or SPD.padPresses > 0 then spdEnd() end return end
+  local fight, key, pc = spdFightPawn()
+  local pad = RUNTIME.events; RUNTIME.events = 0
+  -- A new spectator is a new fight even if the 300 ms poll never saw the field between fights.
+  if fight and key ~= SPD.fightKey then
+    local pending, pv = SPD.pressFight == key and SPD.presses or 0, SPD.pressView
+    spdEnd()
+    SPD.fightKey, SPD.pc, SPD.startWait = key, pc, now()
+    SPD.presses, SPD.pressView, SPD.pressFight = pending, pv, key
   end
-  if SPD.over then return end
+  if fight then
+    inFight, SPD.lostAt = true, nil
+    if not SPD.over then SPD.padPresses = SPD.padPresses + pad end
+  else
+    SPD.lostAt = SPD.lostAt or now()
+    if now() - SPD.lostAt >= 0.5 then spdEnd(); return end
+  end
+  if SPD.over then
+    spdPadInput(false)
+    -- Some battles reuse the spectator: a closed result followed by a visible HUD starts a new cycle.
+    if not spdResult() and live(SPD.view) and SPD.view:IsVisible() then
+      local keepKey, keepPC = SPD.fightKey, SPD.pc
+      spdEnd(); SPD.fightKey, SPD.pc, SPD.startWait = keepKey, keepPC, now()
+    end
+    return
+  end
+  -- Wall time and exception recovery cannot be blocked by a hidden/destroyed HUD or unreadable icons.
+  if SPD.qClock and now() - SPD.qClock >= SPD.qtimeout then spdRecover("quick timeout") end
+  if not SPD.active and SPD.startWait and now() - SPD.startWait >= 5 and not SPD.recovered then
+    spdRecover("HUD not ready")
+  end
+  spdPadInput(fight and not SPD.recovered)
   -- the battle HUD is hidden during skill cut-ins: keep the view once found and keep holding the speed meanwhile
   -- (v4.15 first build dropped the view while hidden, so the game ran those cut-ins at x1)
   -- several BPMV_JHBattleModule_C instances can exist (the last fight's one lingers): switch to a visible one
@@ -1471,10 +1886,11 @@ local function taskSpeed()
   end
   local ws = SPD.ws
   if not (ws and ws:IsValid()) then ws = spdFindWS(); SPD.ws = ws; if not ws then return end end
-  if SPD.active and now() - SPD.resAt > 0.1 then
+  if now() - SPD.resAt > 0.1 then
     SPD.resAt = now()
     local r = spdResult()
-    if r then
+    if not r then SPD.resultReady = true end
+    if r and SPD.resultReady and SPD.active then
       SPD.over, SPD.presses, SPD.padPresses = true, 0, 0
       spdPadInput(false)
       spdMute(false)
@@ -1482,7 +1898,7 @@ local function taskSpeed()
       ws.TimeDilation = 1.0
       if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig; SPD.maxOrig = nil end
       SPD.written = nil
-      if SPD.qClock then print(string.format("[GamepadTweaks] speed: 速战 decided in %.1f s (%s, game re-applied %d times)\n", os.clock() - SPD.qClock, r:gsub("BPMV_", ""):gsub("_C$", ""), SPD.overwrites)) end
+      if SPD.qClock then print(string.format("[GamepadTweaks] speed: 速战 decided in %.1f s (%s, game re-applied %d times)\n", now() - SPD.qClock, r:gsub("BPMV_", ""):gsub("_C$", ""), SPD.overwrites)) end
       spdBadge(0)
       return
     end
@@ -1503,10 +1919,10 @@ local function taskSpeed()
     if not hudUp then return end
     SPD.seen = SPD.seen or now()
     if SPD.presses == 0 and SPD.padPresses == 0 and now() - SPD.seen < 0.3 then return end    -- pending presses never get discarded
-    SPD.active, SPD.on, SPD.overwrites = true, on, 0
+    SPD.active, SPD.on, SPD.overwrites, SPD.recovered = true, on, 0, false
     SPD.quick = iniNumber("quick_battle", 1) == 1
-    SPD.qspeed = iniNumber("quick_speed", 50); if SPD.qspeed < 3 then SPD.qspeed = 3 elseif SPD.qspeed > 200 then SPD.qspeed = 200 end
-    SPD.qtimeout = iniNumber("quick_timeout", 90)
+    SPD.qspeed = math.max(3, math.min(1000, iniNumber("quick_speed", 500)))
+    SPD.qtimeout = math.max(5, math.min(30, iniNumber("quick_timeout", 10)))
     SPD.mask = iniNumber("quick_mask", 1) == 1 and SPD.exports ~= nil and SPD.exports[6] ~= nil
     SPD.mute = iniNumber("quick_mute", 1) == 1
     local m = SPD.mem
@@ -1523,6 +1939,7 @@ local function taskSpeed()
   if SPD.pressView and SPD.pressView ~= v:GetAddress() then presses = 0 end
   presses = presses + SPD.padPresses
   SPD.padPresses = 0
+  if presses > 0 then SPD.recovered = false end                       -- an explicit new press may retry after recovery
   for _ = 1, presses do
     local nxt
     if SPD.level == 1 then nxt = 2
@@ -1536,47 +1953,41 @@ local function taskSpeed()
   local lvl = SPD.level
   spdSetGame(v, lvl == 2)
   SPD.on = spdGameOn(v)
-  local timedOut = false
+  local autoReady = false
   if lvl == SPD_Q then
-    spdMute(SPD.mute)                                                 -- independent of the visual mask
-    if not SPD.qStart then
-      SPD.qStart, SPD.qClock = os.time(), os.clock()
+    if not SPD.qStart then SPD.qStart, SPD.qClock = os.time(), now() end
+    autoReady = spdAuto(v, true)                                      -- never accelerate a still-manual fight
+    spdMute(autoReady and SPD.mute)
+    if autoReady then
       SPD.maxOrig = SPD.maxOrig or ws.MaxGlobalTimeDilation
-    elseif os.clock() - SPD.qClock >= SPD.qtimeout then
-      print(string.format("[GamepadTweaks] speed: 速战 still running after %.1f s, falling back to x2\n", os.clock() - SPD.qClock))
-      SPD.level, lvl, timedOut = 2, 2, true
-      spdRemember(2)
-      spdSetGame(v, true)
-    end
-    if lvl == SPD_Q then
       if ws.MaxGlobalTimeDilation < SPD.qspeed then ws.MaxGlobalTimeDilation = SPD.qspeed end
-      spdAuto(v, true)                                                -- retry if the game reset auto during startup
     end
-  end
-  if lvl ~= SPD_Q then
+  else
     spdMute(false)
     if SPD.qStart then
       SPD.qStart, SPD.qClock = nil, nil
-      if not timedOut then spdAuto(v, false) end                      -- watchdog keeps auto on to finish normally
+      spdAuto(v, false)
       if SPD.maxOrig then ws.MaxGlobalTimeDilation = SPD.maxOrig; SPD.maxOrig = nil end
     end
   end
-  local want = (lvl == SPD_Q) and SPD.qspeed or lvl
+  local want = (lvl == SPD_Q) and (autoReady and SPD.qspeed or 1) or lvl
   if math.abs(ws.TimeDilation - want) > 0.01 then
     if SPD.written then SPD.overwrites = SPD.overwrites + 1 end
     ws.TimeDilation = want
   end
   SPD.written = want
-  if lvl == SPD_Q and SPD.mask then spdBadge(6)                        -- maintained even during cut-ins
-  elseif lvl == SPD_Q and hudUp then spdBadge(5)
+  if lvl == SPD_Q and autoReady and SPD.mask then spdBadge(6)           -- maintained even during cut-ins
+  elseif lvl == SPD_Q and autoReady and hudUp then spdBadge(5)
   else spdBadge(0) end
 end
+
+end -- speed scope
 
 -- ---------------------------------------------------------------- scheduler (20 ms tick)
 -- base tick 20 ms (one game-thread loop for everything; "every" is in ticks)
 local tasks = {
   { every = 25,  fn = taskCursor },
-  { every = 15,  fn = taskMapFlag },
+  { every = 3,   fn = taskMapFlag },
   { every = 100, fn = taskVisited },
   { every = 15,  fn = taskTeleport },
   { every = 15,  fn = taskArrival },
@@ -1592,19 +2003,25 @@ local tasks = {
   { every = 1,   fn = taskObs },
   { every = 1,   fn = taskSpeed },
   { every = 50,  fn = taskAutoSave },
+  { every = 1,   fn = taskWalkAppearance },
+  { every = 5,   fn = taskGift },
 }
 local tick = 0
 local errCount = {}
+os.remove(DIR .. "teleport.req") -- do not replay requests from an earlier session
 writeFile("map.flag", "0")
 writeFile("battle.flag", "0")
 writeFile("fight.flag", "0")
 writeFile("prime.flag", "0"); os.remove(DIR .. "trig.req")
 LoopInGameThreadWithDelay(20, function()
+  if not runtimePoll() then return end
+  if tick == 0 then print("[GamepadTweaks] scheduler: owner tick active\n") end
   tick = tick + 1
   for i, t in ipairs(tasks) do
     if tick % t.every == 0 then
       local ok, err = pcall(t.fn)
       if not ok then
+        if t.fn == taskSpeed then pcall(spdRecover, "speed task error: " .. tostring(err)) end
         errCount[i] = (errCount[i] or 0) + 1
         if errCount[i] <= 3 then print("[GamepadTweaks] task " .. i .. " error: " .. tostring(err) .. "\n") end
       end

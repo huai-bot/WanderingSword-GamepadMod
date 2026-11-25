@@ -1,7 +1,7 @@
 # compile-check main.lua inside the game, install it, close the character screen, hot-reload (Ctrl+R)
 param([string]$expect = "v4.10 loaded", [string]$backupName = "")
 $ErrorActionPreference = 'Stop'
-$W = 'D:\TOOLS\AWSdata\WanderingSword'; $Repo = 'D:\TOOLS\WanderingSword-GamepadMod'; $g = 'D:\GAME\Wandering Sword\Wandering_Sword\Binaries\Win64'
+$W = 'D:\TOOLS\AWSdata\WanderingSword'; $Repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent; $g = 'D:\GAME\Wandering Sword\Wandering_Sword\Binaries\Win64'
 $u = New-Object Text.UTF8Encoding $false
 function Lua([string]$src, [int]$waitMs = 3000) {
   Remove-Item "$W\cmd_out.txt" -ErrorAction SilentlyContinue
